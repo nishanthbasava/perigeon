@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Papa from "papaparse";
+import * as THREE from "three";
 
 // ─── Static data ──────────────────────────────────────────────────
 
@@ -862,157 +863,179 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
   );
 }
 
-// ─── Orbital Simulation ───────────────────────────────────────────
+// ─── Rotating Box Simulation (Three.js) ──────────────────────────
 
-function OrbitalSim() {
+function RotatingBoxSimulation() {
+  const mountRef    = useRef(null);
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const container = mountRef.current;
+    if (!container) return;
+
+    // ── Renderer ──────────────────────────────────────────────────
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setClearColor(0x00000a);
+    container.appendChild(renderer.domElement);
+
+    // ── Scene + Camera ────────────────────────────────────────────
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(
+      50,
+      container.clientWidth / container.clientHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(3.5, 2.2, 4);
+    camera.lookAt(0, 0, 0);
+
+    // ── Lighting ──────────────────────────────────────────────────
+    const ambient = new THREE.AmbientLight(0x223344, 1.2);
+    scene.add(ambient);
+
+    const key = new THREE.DirectionalLight(0x99ccdd, 2.2);
+    key.position.set(4, 6, 5);
+    scene.add(key);
+
+    const fill = new THREE.DirectionalLight(0x334455, 0.8);
+    fill.position.set(-4, -2, -3);
+    scene.add(fill);
+
+    // ── Stars ─────────────────────────────────────────────────────
+    const starGeo = new THREE.BufferGeometry();
+    const starVerts = [];
+    for (let i = 0; i < 1800; i++) {
+      starVerts.push(
+        (Math.random() - 0.5) * 180,
+        (Math.random() - 0.5) * 180,
+        (Math.random() - 0.5) * 180
+      );
+    }
+    starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
+    const starMat  = new THREE.PointsMaterial({ color: 0xffffff, size: 0.18, sizeAttenuation: true });
+    scene.add(new THREE.Points(starGeo, starMat));
+
+    // ── Box ───────────────────────────────────────────────────────
+    const boxGeo  = new THREE.BoxGeometry(1.4, 0.9, 1.1);
+    const boxMat  = new THREE.MeshPhongMaterial({
+      color:     0x2a4a5e,
+      specular:  0x446688,
+      shininess: 40,
+      transparent: true,
+      opacity:   0.92,
+    });
+    const box = new THREE.Mesh(boxGeo, boxMat);
+    scene.add(box);
+
+    // Wireframe edges
+    const edgesGeo = new THREE.EdgesGeometry(boxGeo);
+    const edgesMat = new THREE.LineBasicMaterial({ color: 0x4da8c4, transparent: true, opacity: 0.55 });
+    box.add(new THREE.LineSegments(edgesGeo, edgesMat));
+
+    // ── Axes (lower-left origin helper) ───────────────────────────
+    const axisLen = 1.2;
+    function makeAxis(dir, color) {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        dir.clone().multiplyScalar(axisLen),
+      ]);
+      return new THREE.Line(geo, new THREE.LineBasicMaterial({ color }));
+    }
+    const axesGroup = new THREE.Group();
+    axesGroup.add(makeAxis(new THREE.Vector3(1, 0, 0), 0xdd4444)); // X red
+    axesGroup.add(makeAxis(new THREE.Vector3(0, 1, 0), 0x44dd66)); // Y green
+    axesGroup.add(makeAxis(new THREE.Vector3(0, 0, 1), 0x4488dd)); // Z blue
+    axesGroup.position.set(-2.4, -1.6, 0);
+    scene.add(axesGroup);
+
+    // ── Resize handler ────────────────────────────────────────────
+    const ro = new ResizeObserver(() => {
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    });
+    ro.observe(container);
+
+    // ── Animation loop ────────────────────────────────────────────
+    const clock = new THREE.Clock();
+    let rafId;
+    function animate() {
+      rafId = requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+      box.rotation.x = t * 0.28;
+      box.rotation.y = t * 0.52;
+      setElapsed(t);
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ── Cleanup ───────────────────────────────────────────────────
+    return () => {
+      cancelAnimationFrame(rafId);
+      ro.disconnect();
+      renderer.dispose();
+      boxMat.dispose();
+      boxGeo.dispose();
+      edgesGeo.dispose();
+      edgesMat.dispose();
+      starGeo.dispose();
+      starMat.dispose();
+      if (container.contains(renderer.domElement)) {
+        container.removeChild(renderer.domElement);
+      }
+    };
+  }, []);
+
   return (
-    <div className="flex-1 min-w-0 bg-black rounded-2xl border border-neutral-800 relative overflow-hidden">
-      {/* Telemetry overlay */}
+    <div className="flex-1 min-w-0 bg-[#00000a] rounded-2xl border border-neutral-800 relative overflow-hidden">
+      {/* Three.js canvas mount */}
+      <div ref={mountRef} className="absolute inset-0" />
+
+      {/* Telemetry overlay — top */}
       <div className="absolute top-0 left-0 right-0 z-10 px-6 pt-4 text-center pointer-events-none select-none">
         <p className="text-xs text-neutral-200 font-mono tracking-wide">
-          Visual Time: 4.2s&nbsp;&nbsp;|&nbsp;&nbsp;Physical Time: 2495 s&nbsp;&nbsp;|&nbsp;&nbsp;Speed: 1x
+          Visual Time: {elapsed.toFixed(1)}s&nbsp;&nbsp;|&nbsp;&nbsp;Object: Rotating Box&nbsp;&nbsp;|&nbsp;&nbsp;Mode: Rigid Body
         </p>
         <p className="text-[11px] text-cyan-400/80 font-mono mt-0.5">
-          Physics: Earth J2 + drag + sensor fusion telemetry
+          Physics: VPython-style rigid body rotation
         </p>
         <p className="text-[10px] text-neutral-500 font-mono mt-0.5">
-          Telemetry: 10.0 Hz&nbsp;&nbsp;|&nbsp;&nbsp;5 sats, 4 asteroids, 48 debris&nbsp;&nbsp;|&nbsp;&nbsp;frame 492
+          Renderer: Three.js&nbsp;&nbsp;|&nbsp;&nbsp;ω = 0.52 rad/s (Y)&nbsp;&nbsp;|&nbsp;&nbsp;0.28 rad/s (X)
         </p>
       </div>
 
-      {/* SIM Dashboard card */}
-      <div className="absolute top-4 right-4 z-10 bg-neutral-950/85 border border-neutral-700/50 rounded-lg px-3.5 py-3 backdrop-blur-sm">
+      {/* Sim dashboard — top-right */}
+      <div className="absolute top-4 right-4 z-10 bg-neutral-950/85 border border-neutral-700/50 rounded-lg px-3.5 py-3 backdrop-blur-sm pointer-events-none select-none">
         <p className="text-[9px] text-neutral-500 uppercase tracking-widest mb-2 font-semibold">
           SIM DASHBOARD
         </p>
         <div className="space-y-0.5 text-[10px] font-mono text-neutral-400">
-          <p>Visual time: <span className="text-neutral-200">4.2 s</span></p>
-          <p>Physical time: <span className="text-neutral-200">2475 s</span></p>
-          <p>Speed: <span className="text-neutral-200">1x</span></p>
-          <p>Satellites active: <span className="text-cyan-400">5</span></p>
-          <p>Debris active: <span className="text-amber-400">48</span></p>
-          <p>RF detections: <span className="text-neutral-200">0</span></p>
-          <p>Solar storm: <span className="text-green-400">quiet</span></p>
-          <p>TCAD: <span className="text-neutral-500">fallback/off</span></p>
+          <p>Object: <span className="text-neutral-200">box</span></p>
+          <p>Mode: <span className="text-neutral-200">rigid body</span></p>
+          <p>ω x-axis: <span className="text-cyan-400">0.28 rad/s</span></p>
+          <p>ω y-axis: <span className="text-cyan-400">0.52 rad/s</span></p>
+          <p>Visual time: <span className="text-neutral-200">{elapsed.toFixed(1)} s</span></p>
+          <p>Status: <span className="text-green-400">running</span></p>
         </div>
       </div>
 
-      {/* SVG space scene */}
-      <svg viewBox="0 0 900 580" className="w-full h-full" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <radialGradient id="earthCore" cx="40%" cy="35%" r="65%">
-            <stop offset="0%" stopColor="#5DBBDC" />
-            <stop offset="25%" stopColor="#2F8FC0" />
-            <stop offset="55%" stopColor="#1A65A0" />
-            <stop offset="85%" stopColor="#0E3A6E" />
-            <stop offset="100%" stopColor="#061D3A" />
-          </radialGradient>
-          <radialGradient id="atmoRim" cx="50%" cy="50%" r="50%">
-            <stop offset="72%" stopColor="transparent" />
-            <stop offset="88%" stopColor="#1A7FCC" stopOpacity="0.25" />
-            <stop offset="100%" stopColor="#4AB0E8" stopOpacity="0.08" />
-          </radialGradient>
-          <radialGradient id="cloudLayer" cx="45%" cy="40%" r="55%">
-            <stop offset="0%" stopColor="white" stopOpacity="0.08" />
-            <stop offset="60%" stopColor="white" stopOpacity="0.03" />
-            <stop offset="100%" stopColor="transparent" />
-          </radialGradient>
-          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-            <feGaussianBlur stdDeviation="2.5" result="blur" />
-            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-          </filter>
-          <filter id="warnGlow" x="-80%" y="-80%" width="260%" height="260%">
-            <feGaussianBlur stdDeviation="4" result="blur" />
-            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-          </filter>
-          <radialGradient id="shadowMask" cx="65%" cy="65%" r="55%">
-            <stop offset="40%" stopColor="transparent" />
-            <stop offset="100%" stopColor="#000" stopOpacity="0.55" />
-          </radialGradient>
-        </defs>
-
-        <rect width="900" height="580" fill="#00000A" />
-        {STARS.map(([x, y, r], i) => (
-          <circle key={i} cx={x} cy={y} r={r} fill="white" opacity={0.25 + r * 0.3} />
-        ))}
-
-        <ellipse cx="430" cy="305" rx="430" ry="235" fill="none" stroke="#8B6914"
-          strokeWidth="1.5" strokeOpacity="0.65" transform="rotate(-14 430 305)" />
-        <ellipse cx="430" cy="305" rx="275" ry="175" fill="none" stroke="#4B5563"
-          strokeWidth="1" strokeOpacity="0.5" strokeDasharray="7 5" transform="rotate(-20 430 305)" />
-        <ellipse cx="430" cy="305" rx="160" ry="122" fill="none" stroke="#374151"
-          strokeWidth="1" strokeOpacity="0.75" strokeDasharray="5 4" transform="rotate(-10 430 305)" />
-        <ellipse cx="430" cy="305" rx="150" ry="128" fill="none" stroke="#374151"
-          strokeWidth="0.8" strokeOpacity="0.4" strokeDasharray="4 5" transform="rotate(28 430 305)" />
-
-        <g opacity="0.75">
-          <line x1="430" y1="183" x2="495" y2="295" stroke="#EF4444" strokeWidth="1.2" />
-          <line x1="536" y1="220" x2="495" y2="295" stroke="#EF4444" strokeWidth="1.2" />
-          <line x1="558" y1="308" x2="495" y2="295" stroke="#EF4444" strokeWidth="1" />
-          <line x1="522" y1="348" x2="495" y2="295" stroke="#EF4444" strokeWidth="1" />
-          <line x1="430" y1="183" x2="536" y2="220" stroke="#EF4444" strokeWidth="0.7" strokeDasharray="3 3" />
-        </g>
-        <circle cx="495" cy="295" r="12" fill="#EF4444" fillOpacity="0.08"
-          stroke="#EF4444" strokeWidth="0.8" strokeOpacity="0.4" />
-
-        <circle cx="430" cy="305" r="108" fill="url(#atmoRim)" />
-        <circle cx="430" cy="305" r="90" fill="url(#earthCore)" />
-        <circle cx="430" cy="305" r="90" fill="url(#cloudLayer)" />
-        <ellipse cx="418" cy="272" rx="22" ry="14" fill="#2E7D52" fillOpacity="0.38" transform="rotate(-15 418 272)" />
-        <ellipse cx="448" cy="285" rx="14" ry="10" fill="#2E7D52" fillOpacity="0.32" transform="rotate(10 448 285)" />
-        <ellipse cx="398" cy="300" rx="10" ry="7" fill="#2E7D52" fillOpacity="0.28" />
-        <ellipse cx="455" cy="310" rx="16" ry="8" fill="#2E7D52" fillOpacity="0.30" transform="rotate(-5 455 310)" />
-        <ellipse cx="425" cy="325" rx="12" ry="7" fill="#2E7D52" fillOpacity="0.25" />
-        <circle cx="430" cy="305" r="90" fill="url(#shadowMask)" />
-        <circle cx="430" cy="305" r="90" fill="none" stroke="#5DBBDC" strokeWidth="0.8" strokeOpacity="0.18" />
-        <text x="430" y="408" textAnchor="middle" fill="white" fontSize="12" fontWeight="600"
-          fontFamily="system-ui, sans-serif" opacity="0.85">Earth</text>
-
-        <g filter="url(#glow)">
-          <rect x="426" y="173" width="8" height="5" rx="1" fill="#22D3EE" fillOpacity="0.9" />
-          <rect x="418" y="175" width="6" height="1.5" fill="#22D3EE" fillOpacity="0.6" />
-          <rect x="436" y="175" width="6" height="1.5" fill="#22D3EE" fillOpacity="0.6" />
-          <circle cx="430" cy="175.5" r="2.5" fill="#22D3EE" />
-        </g>
-        <text x="442" y="171" fill="#22D3EE" fontSize="9.5" fontFamily="monospace" fontWeight="500">SAT-01 | LEO</text>
-
-        <circle cx="495" cy="295" r="3.5" fill="#F97316" filter="url(#warnGlow)" />
-        <text x="505" y="292" fill="#F97316" fontSize="9" fontFamily="monospace">COSMOS 2251 DEB</text>
-
-        <circle cx="538" cy="222" r="2.5" fill="#F97316" opacity="0.9" />
-        <text x="548" y="220" fill="#F97316" fontSize="8.5" fontFamily="monospace" opacity="0.85">COSMOS 2251 DEB</text>
-
-        <circle cx="524" cy="350" r="2.5" fill="#F97316" opacity="0.9" />
-        <text x="534" y="348" fill="#F97316" fontSize="8.5" fontFamily="monospace" opacity="0.85">COSMOS 2251 DEB</text>
-
-        <circle cx="355" cy="190" r="2" fill="#F97316" opacity="0.7" />
-        <text x="300" y="188" fill="#F97316" fontSize="8.5" fontFamily="monospace" opacity="0.75">COSMOS 2251 DEB</text>
-
-        <text x="338" y="262" fill="white" fontSize="9" fontFamily="monospace" fillOpacity="0.65">SPHERE 1 | LEO</text>
-
-        <g filter="url(#glow)">
-          <rect x="476" y="413" width="8" height="5" rx="1" fill="#22D3EE" fillOpacity="0.85" />
-          <rect x="468" y="415" width="6" height="1.5" fill="#22D3EE" fillOpacity="0.55" />
-          <rect x="486" y="415" width="6" height="1.5" fill="#22D3EE" fillOpacity="0.55" />
-          <circle cx="480" cy="415.5" r="2.5" fill="#22D3EE" />
-        </g>
-        <text x="493" y="413" fill="#22D3EE" fontSize="9.5" fontFamily="monospace" fontWeight="500">LCS-1 | MEO</text>
-
-        <line x1="385" y1="430" x2="408" y2="490" stroke="#A855F7" strokeWidth="1.2" strokeOpacity="0.45" />
-        <line x1="408" y1="490" x2="415" y2="510" stroke="#A855F7" strokeWidth="0.8" strokeOpacity="0.25" />
-        <g filter="url(#glow)">
-          <rect x="404" y="485" width="7" height="4.5" rx="1" fill="#C084FC" fillOpacity="0.9" />
-          <circle cx="407.5" cy="487" r="2.5" fill="#C084FC" />
-        </g>
-        <text x="420" y="490" fill="#C084FC" fontSize="9.5" fontFamily="monospace">OMNI-M1 | MEO</text>
-
-        <polygon points="408,378 412,370 416,378" fill="#FDE68A" fillOpacity="0.8" />
-        <line x1="412" y1="378" x2="412" y2="383" stroke="#FDE68A" strokeWidth="0.8" strokeOpacity="0.6" />
-        <text x="420" y="378" fill="#FDE68A" fontSize="8.5" fontFamily="monospace" opacity="0.75">Nashville</text>
-      </svg>
+      {/* Axes legend — bottom-left */}
+      <div className="absolute bottom-4 left-4 z-10 pointer-events-none select-none space-y-0.5">
+        <p className="text-[9px] font-mono text-neutral-600 uppercase tracking-widest mb-1">Axes</p>
+        <p className="text-[10px] font-mono"><span className="text-red-400">─</span> X</p>
+        <p className="text-[10px] font-mono"><span className="text-green-400">─</span> Y</p>
+        <p className="text-[10px] font-mono"><span className="text-blue-400">─</span> Z</p>
+      </div>
     </div>
   );
 }
+
+// Keep alias so the JSX call site below doesn't need changing
+const OrbitalSim = RotatingBoxSimulation;
 
 // ─── Right Panel ──────────────────────────────────────────────────
 
