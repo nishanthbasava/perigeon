@@ -14,12 +14,16 @@ from vector_db.task_retriever import (
     build_collision_rag_query,
 )
 from app.agenda_maker import generate_agendas_from_collision
+from app.sim_adapter import (
+    run_simulation, get_events, clear_cache,
+    get_sim_state, start_sim, stop_sim, execute_sim_maneuver,
+)
 
 app = FastAPI(title="Q-Router API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +33,86 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"message": "Q-Router backend running"}
+
+
+# ── Orbital simulation endpoints ───────────────────────────────────────────────
+
+@app.get("/simulation/frames")
+def simulation_frames():
+    """
+    Return pre-computed animation frames (positions in km) + orbit rings + metadata.
+    Cached after first call.
+    """
+    try:
+        result = run_simulation()
+        print(f"[/simulation/frames] returning {result['metadata']['numFrames']} frames, "
+              f"{result['metadata']['numObjects']} objects")
+        return result
+    except Exception as exc:
+        print(f"[/simulation/frames] ERROR: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/simulation/events")
+def simulation_events():
+    """Return conjunction / collision events detected by the simulation."""
+    try:
+        result = get_events()
+        print(f"[/simulation/events] returning {len(result['events'])} event(s)")
+        return result
+    except Exception as exc:
+        print(f"[/simulation/events] ERROR: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/simulation/run")
+def simulation_run():
+    """Clear cached simulation and recompute."""
+    try:
+        clear_cache()
+        result = run_simulation()
+        return {
+            "status": "recomputed",
+            "numFrames": result["metadata"]["numFrames"],
+            "numObjects": result["metadata"]["numObjects"],
+        }
+    except Exception as exc:
+        print(f"[/simulation/run] ERROR: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/simulation/state")
+def simulation_state():
+    """Return current live simulation state; advances one frame if running."""
+    try:
+        return get_sim_state()
+    except Exception as exc:
+        print(f"[/simulation/state] ERROR: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/simulation/start")
+def simulation_start():
+    """Start / resume the simulation loop."""
+    return start_sim()
+
+
+@app.post("/simulation/stop")
+def simulation_stop():
+    """Pause the simulation loop."""
+    return stop_sim()
+
+
+@app.post("/simulation/execute-maneuver")
+def simulation_execute_maneuver(body: dict):
+    """Apply an avoidance maneuver to the primary asset and recompute frames."""
+    try:
+        primary      = body.get("primaryAsset", "SAT-01")
+        maneuver_type = body.get("maneuverType", "prograde")
+        return execute_sim_maneuver(primary, maneuver_type)
+    except Exception as exc:
+        print(f"[/simulation/execute-maneuver] ERROR: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/route-task")

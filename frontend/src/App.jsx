@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Papa from "papaparse";
 import * as THREE from "three";
+import OrbitalSimulation from "./OrbitalSimulation";
 
 // ─── Static data ──────────────────────────────────────────────────
 
@@ -545,8 +546,9 @@ function DetailRow({ label, value, accent }) {
 
 // ─── Agenda card ──────────────────────────────────────────────────
 
-function AgendaCard({ agenda, rank, expanded, onToggle }) {
+function AgendaCard({ agenda, rank, expanded, onToggle, onExecute }) {
   const [expandedTasks, setExpandedTasks] = useState({});
+  const [executed, setExecuted] = useState(false);
 
   const index         = rank - 1;
   const meta          = AGENDA_META[index] ?? AGENDA_META[0];
@@ -576,6 +578,13 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
     e.stopPropagation();
     const html = agendaToHtmlReport(agenda, index);
     downloadHtmlReport(html, `q-router-agenda-${rank}-report.html`);
+  }
+
+  function handleExecute(e) {
+    e.stopPropagation();
+    if (executed) return;
+    setExecuted(true);
+    onExecute?.(agenda);
   }
 
   return (
@@ -658,10 +667,21 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
             </div>
           )}
 
-          {/* Actions — Approve + Export only */}
+          {/* Actions */}
           <div className="flex gap-2 mt-3">
             <button className="flex-1 py-2 text-xs rounded-lg border border-green-500/20 text-green-400/70 hover:border-green-500/40 hover:text-green-300 transition-colors cursor-pointer">
               Approve
+            </button>
+            <button
+              onClick={handleExecute}
+              disabled={executed}
+              className={`flex-1 py-2 text-xs rounded-lg border transition-colors cursor-pointer ${
+                executed
+                  ? "border-green-500/30 text-green-400/60 opacity-70 cursor-default"
+                  : "border-violet-500/20 text-violet-400/70 hover:border-violet-500/40 hover:text-violet-300"
+              }`}
+            >
+              {executed ? "Executed ✓" : "Execute"}
             </button>
             <button
               onClick={handleExport}
@@ -863,179 +883,8 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
   );
 }
 
-// ─── Rotating Box Simulation (Three.js) ──────────────────────────
-
-function RotatingBoxSimulation() {
-  const mountRef    = useRef(null);
-  const [elapsed, setElapsed] = useState(0);
-
-  useEffect(() => {
-    const container = mountRef.current;
-    if (!container) return;
-
-    // ── Renderer ──────────────────────────────────────────────────
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setClearColor(0x00000a);
-    container.appendChild(renderer.domElement);
-
-    // ── Scene + Camera ────────────────────────────────────────────
-    const scene  = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(
-      50,
-      container.clientWidth / container.clientHeight,
-      0.1,
-      1000
-    );
-    camera.position.set(3.5, 2.2, 4);
-    camera.lookAt(0, 0, 0);
-
-    // ── Lighting ──────────────────────────────────────────────────
-    const ambient = new THREE.AmbientLight(0x223344, 1.2);
-    scene.add(ambient);
-
-    const key = new THREE.DirectionalLight(0x99ccdd, 2.2);
-    key.position.set(4, 6, 5);
-    scene.add(key);
-
-    const fill = new THREE.DirectionalLight(0x334455, 0.8);
-    fill.position.set(-4, -2, -3);
-    scene.add(fill);
-
-    // ── Stars ─────────────────────────────────────────────────────
-    const starGeo = new THREE.BufferGeometry();
-    const starVerts = [];
-    for (let i = 0; i < 1800; i++) {
-      starVerts.push(
-        (Math.random() - 0.5) * 180,
-        (Math.random() - 0.5) * 180,
-        (Math.random() - 0.5) * 180
-      );
-    }
-    starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
-    const starMat  = new THREE.PointsMaterial({ color: 0xffffff, size: 0.18, sizeAttenuation: true });
-    scene.add(new THREE.Points(starGeo, starMat));
-
-    // ── Box ───────────────────────────────────────────────────────
-    const boxGeo  = new THREE.BoxGeometry(1.4, 0.9, 1.1);
-    const boxMat  = new THREE.MeshPhongMaterial({
-      color:     0x2a4a5e,
-      specular:  0x446688,
-      shininess: 40,
-      transparent: true,
-      opacity:   0.92,
-    });
-    const box = new THREE.Mesh(boxGeo, boxMat);
-    scene.add(box);
-
-    // Wireframe edges
-    const edgesGeo = new THREE.EdgesGeometry(boxGeo);
-    const edgesMat = new THREE.LineBasicMaterial({ color: 0x4da8c4, transparent: true, opacity: 0.55 });
-    box.add(new THREE.LineSegments(edgesGeo, edgesMat));
-
-    // ── Axes (lower-left origin helper) ───────────────────────────
-    const axisLen = 1.2;
-    function makeAxis(dir, color) {
-      const geo = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(0, 0, 0),
-        dir.clone().multiplyScalar(axisLen),
-      ]);
-      return new THREE.Line(geo, new THREE.LineBasicMaterial({ color }));
-    }
-    const axesGroup = new THREE.Group();
-    axesGroup.add(makeAxis(new THREE.Vector3(1, 0, 0), 0xdd4444)); // X red
-    axesGroup.add(makeAxis(new THREE.Vector3(0, 1, 0), 0x44dd66)); // Y green
-    axesGroup.add(makeAxis(new THREE.Vector3(0, 0, 1), 0x4488dd)); // Z blue
-    axesGroup.position.set(-2.4, -1.6, 0);
-    scene.add(axesGroup);
-
-    // ── Resize handler ────────────────────────────────────────────
-    const ro = new ResizeObserver(() => {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      renderer.setSize(w, h);
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-    });
-    ro.observe(container);
-
-    // ── Animation loop ────────────────────────────────────────────
-    const clock = new THREE.Clock();
-    let rafId;
-    function animate() {
-      rafId = requestAnimationFrame(animate);
-      const t = clock.getElapsedTime();
-      box.rotation.x = t * 0.28;
-      box.rotation.y = t * 0.52;
-      setElapsed(t);
-      renderer.render(scene, camera);
-    }
-    animate();
-
-    // ── Cleanup ───────────────────────────────────────────────────
-    return () => {
-      cancelAnimationFrame(rafId);
-      ro.disconnect();
-      renderer.dispose();
-      boxMat.dispose();
-      boxGeo.dispose();
-      edgesGeo.dispose();
-      edgesMat.dispose();
-      starGeo.dispose();
-      starMat.dispose();
-      if (container.contains(renderer.domElement)) {
-        container.removeChild(renderer.domElement);
-      }
-    };
-  }, []);
-
-  return (
-    <div className="flex-1 min-w-0 bg-[#00000a] rounded-2xl border border-neutral-800 relative overflow-hidden">
-      {/* Three.js canvas mount */}
-      <div ref={mountRef} className="absolute inset-0" />
-
-      {/* Telemetry overlay — top */}
-      <div className="absolute top-0 left-0 right-0 z-10 px-6 pt-4 text-center pointer-events-none select-none">
-        <p className="text-xs text-neutral-200 font-mono tracking-wide">
-          Visual Time: {elapsed.toFixed(1)}s&nbsp;&nbsp;|&nbsp;&nbsp;Object: Rotating Box&nbsp;&nbsp;|&nbsp;&nbsp;Mode: Rigid Body
-        </p>
-        <p className="text-[11px] text-cyan-400/80 font-mono mt-0.5">
-          Physics: VPython-style rigid body rotation
-        </p>
-        <p className="text-[10px] text-neutral-500 font-mono mt-0.5">
-          Renderer: Three.js&nbsp;&nbsp;|&nbsp;&nbsp;ω = 0.52 rad/s (Y)&nbsp;&nbsp;|&nbsp;&nbsp;0.28 rad/s (X)
-        </p>
-      </div>
-
-      {/* Sim dashboard — top-right */}
-      <div className="absolute top-4 right-4 z-10 bg-neutral-950/85 border border-neutral-700/50 rounded-lg px-3.5 py-3 backdrop-blur-sm pointer-events-none select-none">
-        <p className="text-[9px] text-neutral-500 uppercase tracking-widest mb-2 font-semibold">
-          SIM DASHBOARD
-        </p>
-        <div className="space-y-0.5 text-[10px] font-mono text-neutral-400">
-          <p>Object: <span className="text-neutral-200">box</span></p>
-          <p>Mode: <span className="text-neutral-200">rigid body</span></p>
-          <p>ω x-axis: <span className="text-cyan-400">0.28 rad/s</span></p>
-          <p>ω y-axis: <span className="text-cyan-400">0.52 rad/s</span></p>
-          <p>Visual time: <span className="text-neutral-200">{elapsed.toFixed(1)} s</span></p>
-          <p>Status: <span className="text-green-400">running</span></p>
-        </div>
-      </div>
-
-      {/* Axes legend — bottom-left */}
-      <div className="absolute bottom-4 left-4 z-10 pointer-events-none select-none space-y-0.5">
-        <p className="text-[9px] font-mono text-neutral-600 uppercase tracking-widest mb-1">Axes</p>
-        <p className="text-[10px] font-mono"><span className="text-red-400">─</span> X</p>
-        <p className="text-[10px] font-mono"><span className="text-green-400">─</span> Y</p>
-        <p className="text-[10px] font-mono"><span className="text-blue-400">─</span> Z</p>
-      </div>
-    </div>
-  );
-}
-
-// Keep alias so the JSX call site below doesn't need changing
-const OrbitalSim = RotatingBoxSimulation;
+// ─── Orbital Simulation wrapper (alias kept so call site is unchanged) ────────
+const OrbitalSim = OrbitalSimulation;
 
 // ─── Right Panel ──────────────────────────────────────────────────
 
@@ -1051,7 +900,7 @@ function ReviewRow({ title }) {
   );
 }
 
-function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda }) {
+function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda, onExecuteAgenda }) {
   const pillLabel =
     status === "done"    ? `${agendas.length} plans` :
     status === "loading" ? "Generating…"             :
@@ -1128,6 +977,7 @@ function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda })
                 rank={i + 1}
                 expanded={expandedAgendas.has(i)}
                 onToggle={() => onToggleAgenda(i)}
+                onExecute={onExecuteAgenda}
               />
             ))}
           </div>
@@ -1178,6 +1028,7 @@ const RIGHT_MAX = 540;
 export default function App() {
   const [leftWidth, setLeftWidth]   = useState(340);
   const [rightWidth, setRightWidth] = useState(360);
+  const [simRunning, setSimRunning] = useState(false);
 
   // Agenda pipeline state
   const [agendaStatus, setAgendaStatus]         = useState("idle"); // idle | loading | done | error
@@ -1254,7 +1105,7 @@ export default function App() {
     console.log("[q-router] sending features payload:", payload);
 
     try {
-      const res = await fetch("http://localhost:5001/generate-agendas-from-collision", {
+      const res = await fetch("http://127.0.0.1:8000/generate-agendas-from-collision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -1275,6 +1126,33 @@ export default function App() {
       setAgendaStatus("error");
     }
   }, []);
+
+  // Sim event handler — called by OrbitalSimulation when a conjunction is detected
+  const handleSimEvent = useCallback((ev) => {
+    const pc = String(ev.collisionProbability ?? 0.82);
+    const features = [
+      { feature_group: "llm", feature_name: "risk_class",               value: (ev.riskLevel ?? "HIGH").toUpperCase() },
+      { feature_group: "llm", feature_name: "collision_probability",    value: pc },
+      { feature_group: "llm", feature_name: "time_to_closest_approach", value: "262" },
+      { feature_group: "llm", feature_name: "miss_distance_m",          value: String(ev.closestApproachDistanceM ?? ev.missDistanceM ?? 84) },
+      { feature_group: "llm", feature_name: "target_satellite",         value: ev.primaryAsset ?? "SAT-01" },
+      { feature_group: "llm", feature_name: "hazard_object",            value: ev.secondaryObject ?? "COSMOS-DEB-01" },
+      { feature_group: "llm", feature_name: "can_maneuver",             value: "yes" },
+      { feature_group: "llm", feature_name: "delta_v_budget",           value: "2.1 m/s" },
+      { feature_group: "llm", feature_name: "fuel_remaining",           value: "38%" },
+      { feature_group: "llm", feature_name: "thruster_status",          value: "nominal" },
+      { feature_group: "llm", feature_name: "allowed_maneuver_types",   value: "prograde, radial" },
+      { feature_group: "llm", feature_name: "power_risk",               value: "low" },
+      { feature_group: "llm", feature_name: "thermal_risk",             value: "low" },
+      { feature_group: "llm", feature_name: "communication_available",  value: "yes" },
+      { feature_group: "llm", feature_name: "communication_risk",       value: "low" },
+      { feature_group: "llm", feature_name: "sensor_confidence",        value: "0.92" },
+      { feature_group: "llm", feature_name: "trust_level",              value: "high" },
+      { feature_group: "llm", feature_name: "safe_autonomous_control",  value: "yes" },
+      { feature_group: "ml",  feature_name: "raw_pc",                   value: pc },
+    ];
+    handleGenerateAgendas(features);
+  }, [handleGenerateAgendas]);
 
   // CSV upload handler
   const handleUploadCSV = useCallback((e) => {
@@ -1335,6 +1213,44 @@ export default function App() {
     });
   }, []);
 
+  // Start / Stop simulation
+  const handleStartStop = useCallback(async () => {
+    const endpoint = simRunning ? "/simulation/stop" : "/simulation/start";
+    try {
+      await fetch(`http://127.0.0.1:8000${endpoint}`, { method: "POST" });
+      setSimRunning((r) => !r);
+    } catch (e) {
+      console.error("[q-router] start/stop error:", e);
+    }
+  }, [simRunning]);
+
+  // Execute maneuver from an agenda card
+  const handleExecuteManeuver = useCallback(async (agenda) => {
+    try {
+      await fetch("http://127.0.0.1:8000/simulation/execute-maneuver", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agendaId:      agenda.agenda_id ?? "unknown",
+          primaryAsset:  "SAT-01",
+          secondaryObject: "COSMOS-DEB-01",
+          maneuverType:  "prograde",
+        }),
+      });
+      setReasoningSteps((prev) => [
+        ...prev,
+        {
+          title:  "Avoidance maneuver executed",
+          detail: "SAT-01 trajectory adjusted via prograde burn. Predicted miss distance increased to safe separation. Collision risk resolved. Continuing orbital monitoring for next conjunction window.",
+          status: "ok",
+        },
+      ]);
+      setRevealedCount((c) => c + 1);
+    } catch (e) {
+      console.error("[q-router] execute-maneuver error:", e);
+    }
+  }, []);
+
   return (
     <div className="h-screen w-screen bg-neutral-950 text-neutral-100 flex flex-col overflow-hidden">
       {/* Header */}
@@ -1348,14 +1264,24 @@ export default function App() {
             Orbital AI Copilot
           </span>
         </div>
-        <div className="flex items-center gap-5">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={handleStartStop}
+            className={`text-xs px-4 py-1 rounded-full border font-medium transition-colors duration-150 cursor-pointer ${
+              simRunning
+                ? "border-red-500/40 text-red-400 hover:border-red-500/60 hover:text-red-300"
+                : "border-green-500/40 text-green-400 hover:border-green-500/60 hover:text-green-300"
+            }`}
+          >
+            {simRunning ? "Stop Simulation" : "Start Simulation"}
+          </button>
           <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${simRunning ? "bg-red-500 animate-pulse" : "bg-neutral-600"}`} />
             <span className="text-xs text-neutral-400">Conjunction alert</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
-            <span className="text-xs text-neutral-500">System nominal</span>
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${simRunning ? "bg-green-500" : "bg-neutral-600"}`} />
+            <span className="text-xs text-neutral-500">{simRunning ? "Simulation live" : "System nominal"}</span>
           </div>
         </div>
       </header>
@@ -1377,7 +1303,7 @@ export default function App() {
           collisionSummary={collisionSummary}
         />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("left", e)} />
-        <OrbitalSim />
+        <OrbitalSim onSimEvent={handleSimEvent} running={simRunning} />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("right", e)} />
         <RightPanel
           style={{ width: rightWidth }}
@@ -1385,6 +1311,7 @@ export default function App() {
           agendas={agendas}
           expandedAgendas={expandedAgendas}
           onToggleAgenda={toggleAgenda}
+          onExecuteAgenda={handleExecuteManeuver}
         />
       </main>
     </div>
