@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+backend/venv/
+venv/
+.venv/
+
+# Generated vector database (rebuild with build_task_vector_db.py)
+backend/vector_db/chroma_task_db/
+
+# HuggingFace model cache
+.cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env files
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
