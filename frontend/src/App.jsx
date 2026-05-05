@@ -150,17 +150,7 @@ const AGENDA_META = [
   { label: "Rapid Response",         strategy: "Fastest intervention sequence",    defaultConfidence: 68 },
 ];
 
-// ─── XML / export helpers ─────────────────────────────────────────
-
-function escapeXml(value) {
-  if (value == null) return "";
-  return String(value)
-    .replace(/&/g,  "&amp;")
-    .replace(/</g,  "&lt;")
-    .replace(/>/g,  "&gt;")
-    .replace(/"/g,  "&quot;")
-    .replace(/'/g,  "&apos;");
-}
+// ─── Export helpers ───────────────────────────────────────────────
 
 function getAssignedAssets(task) {
   const name = (task.task_name ?? "").toLowerCase();
@@ -220,81 +210,148 @@ function getTaskDecisionDetails(task) {
   return { whySelected, inputSignals, logicGates, expectedOutput, analystNote };
 }
 
-function agendaToXmlReport(agenda, index) {
+function escapeHtml(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/&/g,  "&amp;")
+    .replace(/</g,  "&lt;")
+    .replace(/>/g,  "&gt;")
+    .replace(/"/g,  "&quot;");
+}
+
+function agendaToHtmlReport(agenda, index) {
   const meta    = AGENDA_META[index] ?? AGENDA_META[0];
   const rawConf = agenda.confidence * 100;
   const conf    = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
   const sc      = agenda.scenario ?? {};
-  const primary = sc.target_satellite || "Unknown";
-  const secondary = sc.hazard_object  || "Unknown";
-  const pc      = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
-  const tca     = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(2)} hr` : "Pending telemetry";
-  const now     = new Date().toISOString();
+  const primary   = sc.target_satellite || "Unknown";
+  const secondary = sc.hazard_object    || "Unknown";
+  const pc        = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
+  const tca       = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(2)} hr` : "Pending telemetry";
+  const now       = new Date().toLocaleString("en-US", { timeZoneName: "short" });
 
-  const tasksXml = (agenda.tasks ?? []).map((t) => {
+  const taskRows = (agenda.tasks ?? []).map((t) => {
     const assets  = getAssignedAssets(t);
     const details = getTaskDecisionDetails(t);
     const route   = t.quantum_candidate === "yes" ? "Quantum" : "Classical";
-    const assetsXml  = assets.map((a) => `        <Asset>${escapeXml(a)}</Asset>`).join("\n");
-    const signalsXml = details.inputSignals.map((s) => `        <Signal>${escapeXml(s)}</Signal>`).join("\n");
-    const gatesXml   = details.logicGates.map((g) =>
-      `        <Gate name="${escapeXml(g.name)}">${escapeXml(g.result)}</Gate>`
-    ).join("\n");
-
+    const stepNum = String(t.seq ?? "?").padStart(2, "0");
     return `
-    <Task order="${escapeXml(t.seq)}">
-      <TaskName>${escapeXml(t.task_name)}</TaskName>
-      <AssignedAssets>
-${assetsXml}
-      </AssignedAssets>
-      <ComputeRoute>${route}</ComputeRoute>
-      <Purpose>${escapeXml(t.reason || details.whySelected)}</Purpose>
-      <WhySelected>${escapeXml(details.whySelected)}</WhySelected>
-      <InputSignals>
-${signalsXml}
-      </InputSignals>
-      <LogicGateResults>
-${gatesXml}
-      </LogicGateResults>
-      <ExpectedOutput>${escapeXml(details.expectedOutput)}</ExpectedOutput>
-      <AnalystReviewNote>${escapeXml(details.analystNote)}</AnalystReviewNote>
-    </Task>`;
+      <tr>
+        <td>${escapeHtml(stepNum)}</td>
+        <td><strong>${escapeHtml(t.task_name)}</strong></td>
+        <td>${escapeHtml(assets.join(", "))}</td>
+        <td>${escapeHtml(route)}</td>
+        <td>${escapeHtml(t.reason || details.whySelected)}</td>
+        <td>${escapeHtml(details.expectedOutput)}</td>
+      </tr>`;
   }).join("\n");
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<QRouterManeuverAgendaReport>
+  const rationaleRows = (agenda.tasks ?? []).map((t) => {
+    const details = getTaskDecisionDetails(t);
+    const gatesStr = details.logicGates.map((g) => `${g.name}: ${g.result}`).join(" | ");
+    return `
+      <tr>
+        <td><strong>${escapeHtml(t.task_name)}</strong></td>
+        <td>${escapeHtml(details.whySelected)}</td>
+        <td>${escapeHtml(details.inputSignals.join(", "))}</td>
+        <td>${escapeHtml(gatesStr)}</td>
+        <td>${escapeHtml(details.analystNote)}</td>
+      </tr>`;
+  }).join("\n");
 
-  <ReportMetadata>
-    <System>Q-Router</System>
-    <ReportType>Maneuver Agenda Recommendation</ReportType>
-    <GeneratedAt>${now}</GeneratedAt>
-    <Status>DraftForAnalystReview</Status>
-  </ReportMetadata>
+  const warningsHtml = agenda.warnings && agenda.warnings.length > 0
+    ? `<p><strong>Warnings:</strong> ${agenda.warnings.map(escapeHtml).join("; ")}</p>`
+    : "";
 
-  <Agenda>
-    <AgendaId>${index + 1}</AgendaId>
-    <Name>${escapeXml(meta.label)}</Name>
-    <Strategy>${escapeXml(meta.strategy)}</Strategy>
-    <ConfidencePercent>${conf}</ConfidencePercent>
-    <Status>Draft</Status>
-  </Agenda>
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Q-Router Maneuver Agenda Report — ${escapeHtml(meta.label)}</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; color: #111; background: #fff; margin: 40px; line-height: 1.45; }
+    .classification { text-align: center; font-weight: bold; letter-spacing: 0.08em; border-top: 2px solid #111; border-bottom: 2px solid #111; padding: 8px 0; margin-bottom: 24px; }
+    h1 { font-size: 22px; margin-bottom: 4px; }
+    h2 { font-size: 14px; margin-top: 28px; border-bottom: 1px solid #999; padding-bottom: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    th, td { border: 1px solid #aaa; padding: 8px; vertical-align: top; text-align: left; }
+    th { background: #f2f2f2; font-weight: bold; }
+    .meta-grid { display: grid; grid-template-columns: 180px 1fr; gap: 6px 12px; font-size: 14px; margin-top: 12px; }
+    .label { font-weight: bold; }
+    .footer { margin-top: 36px; font-size: 12px; color: #555; border-top: 1px solid #aaa; padding-top: 12px; }
+    .tag { display: inline-block; background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; border-radius: 4px; padding: 2px 8px; font-size: 12px; font-weight: bold; margin-left: 8px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <div class="classification">DRAFT — FOR ANALYST REVIEW</div>
 
-  <Scenario>
-    <PrimaryAsset>${escapeXml(primary)}</PrimaryAsset>
-    <SecondaryObject>${escapeXml(secondary)}</SecondaryObject>
-    <CollisionProbability>${escapeXml(pc)}</CollisionProbability>
-    <TimeOfClosestApproach>${escapeXml(tca)}</TimeOfClosestApproach>
-    <RecommendedAction>Review and approve task sequence before command uplink.</RecommendedAction>
-  </Scenario>
+  <h1>Q-Router Maneuver Agenda Recommendation <span class="tag">Agenda ${index + 1}</span></h1>
+  <p>Generated by Q-Router Orbital AI Copilot. This is a draft recommendation requiring human analyst review.</p>
 
-  <TaskSequence>${tasksXml}
-  </TaskSequence>
+  <h2>1. Report Metadata</h2>
+  <div class="meta-grid">
+    <div class="label">Report Type</div><div>Maneuver Agenda Recommendation</div>
+    <div class="label">Generated At</div><div>${escapeHtml(now)}</div>
+    <div class="label">Status</div><div>Draft for Analyst Review</div>
+    <div class="label">Agenda Name</div><div>${escapeHtml(meta.label)}</div>
+    <div class="label">Strategy</div><div>${escapeHtml(meta.strategy)}</div>
+    <div class="label">Confidence</div><div>${conf}%</div>
+  </div>
 
-</QRouterManeuverAgendaReport>`;
+  <h2>2. Scenario Summary</h2>
+  <div class="meta-grid">
+    <div class="label">Primary Asset</div><div>${escapeHtml(primary)}</div>
+    <div class="label">Secondary Object</div><div>${escapeHtml(secondary)}</div>
+    <div class="label">Collision Probability</div><div>${escapeHtml(pc)}</div>
+    <div class="label">Time to Closest Approach</div><div>${escapeHtml(tca)}</div>
+    <div class="label">Recommended Action</div><div>Review and approve task sequence before command uplink.</div>
+  </div>
+  ${warningsHtml}
+
+  <h2>3. Recommended Task Sequence</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Task</th>
+        <th>Assigned Asset(s)</th>
+        <th>Compute Route</th>
+        <th>Purpose</th>
+        <th>Expected Output</th>
+      </tr>
+    </thead>
+    <tbody>${taskRows}
+    </tbody>
+  </table>
+
+  <h2>4. Decision Rationale</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Task</th>
+        <th>Why Selected</th>
+        <th>Input Signals</th>
+        <th>Logic Gate Results</th>
+        <th>Analyst Review Note</th>
+      </tr>
+    </thead>
+    <tbody>${rationaleRows}
+    </tbody>
+  </table>
+
+  <h2>5. Analyst Disposition</h2>
+  <p>This agenda is a draft recommendation. Final maneuver approval requires human flight dynamics analyst review before command uplink. No autonomous execution should occur without explicit analyst approval.</p>
+
+  <div class="footer">
+    Q-Router Orbital AI Copilot — report generated ${escapeHtml(now)}. Not an operational flight safety product. For demonstration and research purposes only.
+  </div>
+</body>
+</html>`;
 }
 
-function downloadXmlReport(xml, filename) {
-  const blob = new Blob([xml], { type: "application/xml" });
+function downloadHtmlReport(html, filename) {
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement("a");
   a.href     = url;
@@ -459,8 +516,9 @@ function DetailRow({ label, value, accent }) {
 function AgendaCard({ agenda, rank, expanded, onToggle }) {
   const [expandedTasks, setExpandedTasks] = useState({});
 
-  const index   = rank - 1;
-  const meta    = AGENDA_META[index] ?? AGENDA_META[0];
+  const index         = rank - 1;
+  const meta          = AGENDA_META[index] ?? AGENDA_META[0];
+  const isRecommended = rank === 1;
 
   const rawConf = agenda.confidence * 100;
   const confPct = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
@@ -472,27 +530,38 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
   const pcVal     = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
   const tcaVal    = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(1)} hr` : "Pending telemetry";
 
+  // Green border for recommended (rank 1), default for others
+  const cardBorder = isRecommended ? "border-green-500/30" : "border-white/5";
+  const headerHover = isRecommended ? "hover:bg-green-500/[0.04]" : "hover:bg-white/2";
+
   function toggleTask(key) {
     setExpandedTasks((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
   function handleExport(e) {
     e.stopPropagation();
-    const xml = agendaToXmlReport(agenda, index);
-    downloadXmlReport(xml, `q-router-agenda-${rank}-report.xml`);
+    const html = agendaToHtmlReport(agenda, index);
+    downloadHtmlReport(html, `q-router-agenda-${rank}-report.html`);
   }
 
   return (
-    <div className="border border-white/5 rounded-xl overflow-hidden">
+    <div className={`border ${cardBorder} rounded-xl overflow-hidden`}>
       {/* Header */}
       <button
         onClick={onToggle}
-        className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-white/2 transition-colors"
+        className={`w-full flex items-start gap-3 px-4 py-3.5 text-left transition-colors ${headerHover}`}
       >
         <span className="text-[10px] font-mono text-neutral-600 w-4 mt-0.5 shrink-0">{rank}</span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-            <span className="text-sm font-medium text-neutral-100">{meta.label}</span>
+            <span className={`text-sm font-medium ${isRecommended ? "text-green-300" : "text-neutral-100"}`}>
+              {meta.label}
+            </span>
+            {isRecommended && (
+              <span className="text-[9px] border border-green-500/40 text-green-400/80 px-1.5 py-0.5 rounded-full leading-none">
+                Recommended
+              </span>
+            )}
             {agenda.needs_human_review && (
               <span className="text-[9px] border border-amber-500/30 text-amber-400/70 px-1.5 py-0.5 rounded-full leading-none">
                 Review required
@@ -510,7 +579,7 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
 
       {/* Expanded body */}
       {expanded && (
-        <div className="px-4 pb-4 border-t border-white/5">
+        <div className={`px-4 pb-4 border-t ${isRecommended ? "border-green-500/10" : "border-white/5"}`}>
           {/* Scenario block */}
           <div className="mt-3 mb-3 grid grid-cols-2 gap-x-4 gap-y-1.5 p-3 bg-neutral-900/60 rounded-lg text-[11px]">
             <ScenarioField label="Primary asset"    value={primary} />
@@ -554,13 +623,10 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
             </div>
           )}
 
-          {/* Actions */}
+          {/* Actions — Approve + Export only */}
           <div className="flex gap-2 mt-3">
             <button className="flex-1 py-2 text-xs rounded-lg border border-green-500/20 text-green-400/70 hover:border-green-500/40 hover:text-green-300 transition-colors cursor-pointer">
               Approve
-            </button>
-            <button className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer">
-              Send for review
             </button>
             <button
               onClick={handleExport}
@@ -620,7 +686,7 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
       {/* Header */}
       <div className="px-5 py-4 border-b border-white/5 shrink-0">
         <div className="flex items-center justify-between mb-0.5">
-          <h2 className="text-sm font-medium text-neutral-100">Q-Router Copilot</h2>
+          <h2 className="text-sm font-medium text-neutral-100 font-mono-tech">Q-Router Copilot</h2>
           <span className={`text-[10px] border rounded-full px-2 py-0.5 leading-4 ${pillColor}`}>
             {statusPill}
           </span>
@@ -948,7 +1014,7 @@ function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda })
       {/* Header */}
       <div className="px-5 py-4 border-b border-white/5 shrink-0">
         <div className="flex items-center justify-between mb-0.5">
-          <h2 className="text-sm font-medium text-neutral-100">Maneuver Plans</h2>
+          <h2 className="text-sm font-medium text-neutral-100 font-mono-tech">Maneuver Plans</h2>
           <span className={`text-[10px] border rounded-full px-2 py-0.5 leading-4 ${pillColor}`}>
             {pillLabel}
           </span>
@@ -1220,7 +1286,7 @@ export default function App() {
         style={{ height: 44 }}
       >
         <div className="flex items-center gap-3">
-          <span className="text-sm font-medium text-neutral-100">Q-Router</span>
+          <span className="text-sm font-medium text-neutral-100 font-mono-tech">Q-Router</span>
           <span className="text-xs text-neutral-600 border-l border-white/5 pl-3">
             Orbital AI Copilot
           </span>

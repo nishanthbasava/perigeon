@@ -15,3 +15,8 @@ body {
   width: 100%;
   min-height: 100svh;
 }
+
+/* Telemetry / mission title monospace — applied only to specific headings */
+.font-mono-tech {
+  font-family: "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+}
