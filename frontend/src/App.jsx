@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import Papa from "papaparse";
 
 // ─── Static data ──────────────────────────────────────────────────
 
@@ -38,6 +39,73 @@ const SAMPLE_COLLISION = {
     { feature_group: "ml",  feature_name: "raw_pc",                   value: "0.18" },
   ],
 };
+
+// ─── CSV helpers ─────────────────────────────────────────────────
+
+const REQUIRED_CSV_FIELDS = [
+  "object_id", "hazard_id", "risk_class", "collision_probability_estimate",
+  "time_to_closest_approach_s", "closest_approach_distance_m", "closing_speed_mps",
+  "can_maneuver", "mission_priority", "fuel_remaining_kg", "max_delta_v_mps",
+  "power_state", "thermal_state", "comms_state", "tcad_trust_level",
+  "safe_to_autonomously_execute",
+];
+
+function parseBool(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") {
+    return ["true", "1", "yes", "y"].includes(value.toLowerCase().trim());
+  }
+  return false;
+}
+
+function convertCSVRowToFeatures(row) {
+  return [
+    {
+      feature_group: "collision",
+      object_id: row.object_id,
+      hazard_id: row.hazard_id,
+      object_type: row.object_type || "satellite",
+      active: parseBool(row.active ?? true),
+      can_maneuver: parseBool(row.can_maneuver),
+      collision_probability_estimate: Number(row.collision_probability_estimate),
+      risk_class: row.risk_class,
+      time_to_closest_approach_s: Number(row.time_to_closest_approach_s),
+      closest_approach_distance_m: Number(row.closest_approach_distance_m),
+      closing_speed_mps: Number(row.closing_speed_mps),
+    },
+    {
+      feature_group: "llm",
+      hazard_id: row.hazard_id,
+      target_satellite_id: row.object_id,
+      mission_priority: row.mission_priority,
+      fuel_remaining_kg: Number(row.fuel_remaining_kg),
+      max_delta_v_mps: Number(row.max_delta_v_mps),
+      power_state: row.power_state,
+      thermal_state: row.thermal_state,
+      comms_state: row.comms_state,
+      tcad_trust_level: Number(row.tcad_trust_level),
+      safe_to_autonomously_execute: parseBool(row.safe_to_autonomously_execute),
+      maneuver_constraints: {
+        max_burn_duration_s: row.max_burn_duration_s ? Number(row.max_burn_duration_s) : 120,
+        preferred_directions: row.preferred_directions
+          ? row.preferred_directions.split("|").map((s) => s.trim())
+          : ["prograde"],
+        forbidden_directions: row.forbidden_directions
+          ? row.forbidden_directions.split("|").map((s) => s.trim())
+          : [],
+      },
+    },
+  ];
+}
+
+function validateCSVRow(row) {
+  const missing = REQUIRED_CSV_FIELDS.filter((f) => row[f] == null || row[f] === "");
+  if (missing.length > 0) {
+    return `Missing required fields: ${missing.join(", ")}`;
+  }
+  return null;
+}
 
 const STATIC_STEPS = [
   {
@@ -256,7 +324,7 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
 
 // ─── Left Panel ───────────────────────────────────────────────────
 
-function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg }) {
+function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg, csvState, onUploadCSV, csvFileRef }) {
   const statusPill =
     status === "loading" ? "Processing" :
     status === "done"    ? "Complete"   :
@@ -348,11 +416,26 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
         </p>
         <div className="flex flex-wrap gap-1.5 mb-3">
           <button
-            onClick={onGenerate}
+            onClick={() => onGenerate()}
             disabled={status === "loading"}
             className="text-xs px-3 py-1 rounded-full border border-cyan-500/30 text-cyan-400/80 hover:border-cyan-500/50 hover:text-cyan-300 transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Generate agendas
+          </button>
+          {/* Hidden file input — triggered by the Upload CSV button below */}
+          <input
+            ref={csvFileRef}
+            type="file"
+            accept=".csv"
+            className="hidden"
+            onChange={onUploadCSV}
+          />
+          <button
+            onClick={() => csvFileRef.current?.click()}
+            disabled={status === "loading"}
+            className="text-xs px-3 py-1 rounded-full border border-white/10 text-neutral-400 hover:border-white/20 hover:text-neutral-200 transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Upload CSV
           </button>
           {["Analyze risk", "Explain routing"].map((label) => (
             <button
@@ -363,6 +446,20 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
             </button>
           ))}
         </div>
+
+        {/* CSV status feedback */}
+        {csvState.filename && (
+          <p className="text-[10px] text-neutral-500 mb-1.5 truncate">
+            <span className="text-neutral-600">CSV: </span>
+            <span className="font-mono text-neutral-400">{csvState.filename}</span>
+            {csvState.error && (
+              <span className="text-red-400 ml-2">{csvState.error}</span>
+            )}
+          </p>
+        )}
+        {!csvState.filename && csvState.error && (
+          <p className="text-[10px] text-red-400 mb-1.5">{csvState.error}</p>
+        )}
       </div>
 
       {/* Input */}
@@ -689,6 +786,11 @@ export default function App() {
   const [expandedSteps, setExpandedSteps]   = useState(new Set());
   const [expandedAgendas, setExpandedAgendas] = useState(new Set([0])); // first expanded by default
 
+  // CSV upload state
+  const [uploadedFeatures, setUploadedFeatures] = useState(null);
+  const [csvState, setCsvState] = useState({ filename: "", error: "" });
+  const csvFileRef = useRef(null);
+
   // Panel resize
   const dragging   = useRef(null);
   const startX     = useRef(0);
@@ -732,8 +834,8 @@ export default function App() {
     return () => clearTimeout(t);
   }, [agendaStatus, reasoningSteps, revealedCount]);
 
-  // Generate agendas
-  const handleGenerateAgendas = useCallback(async () => {
+  // Generate agendas — accepts optional uploadedFeatures; falls back to SAMPLE_COLLISION
+  const handleGenerateAgendas = useCallback(async (featuresOverride) => {
     setAgendaStatus("loading");
     setReasoningSteps([]);
     setAgendas([]);
@@ -742,17 +844,24 @@ export default function App() {
     setExpandedSteps(new Set());
     setExpandedAgendas(new Set([0]));
 
+    const payload = featuresOverride
+      ? { features: featuresOverride }
+      : SAMPLE_COLLISION;
+
+    console.log("[q-router] sending features payload:", payload);
+
     try {
       const res = await fetch("http://localhost:5001/generate-agendas-from-collision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(SAMPLE_COLLISION),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail ?? `HTTP ${res.status}`);
       }
       const data = await res.json();
+      console.log("[q-router] backend response:", data);
       setReasoningSteps(data.reasoning_steps ?? []);
       setAgendas(data.agendas ?? []);
       setAgendaStatus("done");
@@ -761,6 +870,50 @@ export default function App() {
       setAgendaStatus("error");
     }
   }, []);
+
+  // CSV upload handler
+  const handleUploadCSV = useCallback((e) => {
+    const file = e.target.files?.[0];
+    // Reset so the same file can be re-selected if needed
+    e.target.value = "";
+
+    if (!file) {
+      setCsvState({ filename: "", error: "No file selected." });
+      return;
+    }
+
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (results) => {
+        console.log("[q-router] raw CSV rows:", results.data);
+
+        if (!results.data || results.data.length === 0) {
+          setCsvState({ filename: file.name, error: "CSV is empty." });
+          return;
+        }
+
+        // TODO: support batch/event selection when multiple rows are present
+        const row = results.data[0];
+
+        const validationError = validateCSVRow(row);
+        if (validationError) {
+          setCsvState({ filename: file.name, error: validationError });
+          return;
+        }
+
+        const features = convertCSVRowToFeatures(row);
+        console.log("[q-router] converted features:", features);
+
+        setCsvState({ filename: file.name, error: "" });
+        setUploadedFeatures(features);
+        handleGenerateAgendas(features);
+      },
+      error: (err) => {
+        setCsvState({ filename: file.name, error: `Parse error: ${err.message}` });
+      },
+    });
+  }, [handleGenerateAgendas]);
 
   const toggleStep = useCallback((i) => {
     setExpandedSteps((prev) => {
@@ -814,6 +967,9 @@ export default function App() {
           onToggleStep={toggleStep}
           onGenerate={handleGenerateAgendas}
           errorMsg={errorMsg}
+          csvState={csvState}
+          onUploadCSV={handleUploadCSV}
+          csvFileRef={csvFileRef}
         />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("left", e)} />
         <OrbitalSim />
