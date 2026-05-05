@@ -1,15 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-const API = "http://127.0.0.1:8000";
-const R_EARTH_KM = 6371.0;
+// ─── Sim speed ────────────────────────────────────────────────────
+// 0.12 = ~8x slower than original; one orbit takes ~3 minutes wall clock
+const SIM_SPEED = 0.12;
 
-// ECI (km) → Three.js scene units.  ECI: X/Y equatorial plane, Z north pole.
-// Three.js: Y-up.  Mapping: THREE(x, y, z) = ECI(x/R, z/R, y/R)
-function eciKmToScene(x, y, z) {
-  return new THREE.Vector3(x / R_EARTH_KM, z / R_EARTH_KM, y / R_EARTH_KM);
-}
+// ─── Satellite / debris definitions ──────────────────────────────
+// r: scene units (1 = 1 R_Earth), omega: rad/s before multiplier,
+// phi0: deterministic start angle (rad), inc: inclination (rad)
+const SATELLITE_DEFS = [
+  { id: "SAT-01",          type: "satellite", r: 1.075, omega: 0.30 * SIM_SPEED, phi0: 0.0,  inc: 0.90 },
+  { id: "SAT-03",          type: "satellite", r: 1.063, omega: 0.27 * SIM_SPEED, phi0: 1.05, inc: 0.52 },
+  { id: "COSMOS 2251 DEB", type: "debris",    r: 1.082, omega: 0.31 * SIM_SPEED, phi0: 3.30, inc: 0.93 },
+  { id: "IRIDIUM 33 DEB",  type: "debris",    r: 1.068, omega: 0.26 * SIM_SPEED, phi0: 5.00, inc: 1.50 },
+];
 
 const COLOR = {
   satellite: 0x00e5ff,
@@ -17,28 +22,121 @@ const COLOR = {
   earth:     0x0e2d52,
   earthGrid: 0x1a4a88,
   equator:   0x2266aa,
-  star:      0xffffff,
-  conj:      0xff2222,
+  conj:      0xff3333,
+  maneuver:  0x22ff88,
 };
 
-export default function OrbitalSimulation({ onSimEvent, running }) {
+// Parametric orbital position (inclination tilt around X axis in Three.js Y-up)
+function orbitalPos(t, r, omega, phi0, inc) {
+  const theta = omega * t + phi0;
+  const xOrb  = r * Math.cos(theta);
+  const yOrb  = r * Math.sin(theta);
+  return new THREE.Vector3(xOrb, yOrb * Math.sin(inc), yOrb * Math.cos(inc));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Props:
+//   running            boolean  – advances sim time when true
+//   resetKey           number   – increment to restart from t=0
+//   activeConjunctions [{primaryAsset, secondaryObject}]
+//   executedAssets     Set<string>  – assets that had maneuver executed
+// ─────────────────────────────────────────────────────────────────
+export default function OrbitalSimulation({
+  running,
+  resetKey,
+  activeConjunctions,
+  executedAssets,
+}) {
   const mountRef = useRef(null);
 
-  const [simStatus, setSimStatus] = useState("loading");
-  const [frameInfo, setFrameInfo] = useState({ frame: 0, t: 0, total: 0, objects: 0 });
-  const [eventInfo, setEventInfo] = useState(null);
+  // Mutable refs updated from props without re-running the main effect
+  const runningRef        = useRef(running);
+  const activeConjRef     = useRef(activeConjunctions ?? []);
+  const executedRef       = useRef(executedAssets ?? new Set());
 
-  // Refs shared between the scene-setup effect and the polling effect
-  const onSimEventRef  = useRef(onSimEvent);
-  const sceneRef       = useRef(null);
-  const objMeshesRef   = useRef({});
-  const conjLineRef    = useRef(null);
-  const lastEventIdRef = useRef(null);
-  const toDisposeRef   = useRef([]);
+  // Scene refs
+  const sceneRef          = useRef(null);
+  const objMeshesRef      = useRef({});
+  const conjLinesRef      = useRef({});   // key "A-vs-B" → THREE.Line
+  const maneuverArcsRef   = useRef({});   // key assetId (and assetId+"-ring") → line
+  const simTimeRef        = useRef(0);
+  const lastNowRef        = useRef(null);
+  const toDisposeRef      = useRef([]);
 
-  useEffect(() => { onSimEventRef.current = onSimEvent; }, [onSimEvent]);
+  // Keep mutable refs in sync with props
+  useEffect(() => { runningRef.current = running; }, [running]);
+  useEffect(() => { activeConjRef.current = activeConjunctions ?? []; }, [activeConjunctions]);
+  useEffect(() => { executedRef.current  = executedAssets ?? new Set(); }, [executedAssets]);
 
-  // ── Build Three.js scene once on mount ──────────────────────────────────────
+  // ── Reset on resetKey change ──────────────────────────────────
+  useEffect(() => {
+    simTimeRef.current  = 0;
+    lastNowRef.current  = null;
+
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    // Remove all maneuver arcs / rings
+    for (const line of Object.values(maneuverArcsRef.current)) {
+      scene.remove(line);
+      line.geometry?.dispose();
+      line.material?.dispose();
+    }
+    maneuverArcsRef.current = {};
+
+    // Remove all conjunction lines
+    for (const line of Object.values(conjLinesRef.current)) {
+      scene.remove(line);
+      line.geometry?.dispose();
+      line.material?.dispose();
+    }
+    conjLinesRef.current = {};
+  }, [resetKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Add maneuver arc + new orbit ring when an asset is executed ─
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    for (const def of SATELLITE_DEFS) {
+      if (!executedAssets?.has(def.id)) continue;
+      if (maneuverArcsRef.current[def.id]) continue; // already drawn
+
+      const r_new = def.r + 0.018;
+      const t     = simTimeRef.current;
+      const currentTheta = def.omega * t + def.phi0;
+
+      // Short green arc showing the burn trajectory
+      const arcPts = [];
+      for (let i = 0; i <= 48; i++) {
+        const th   = currentTheta + (i / 48) * (Math.PI * 0.75);
+        const xOrb = r_new * Math.cos(th);
+        const yOrb = r_new * Math.sin(th);
+        arcPts.push(new THREE.Vector3(xOrb, yOrb * Math.sin(def.inc), yOrb * Math.cos(def.inc)));
+      }
+      const arcGeo = new THREE.BufferGeometry().setFromPoints(arcPts);
+      const arcMat = new THREE.LineBasicMaterial({ color: COLOR.maneuver, transparent: true, opacity: 0.90 });
+      const arc    = new THREE.Line(arcGeo, arcMat);
+      scene.add(arc);
+      maneuverArcsRef.current[def.id] = arc;
+
+      // Full new orbit ring in green (replaces old ring visually)
+      const ringPts = [];
+      for (let i = 0; i <= 128; i++) {
+        const th   = (i / 128) * 2 * Math.PI;
+        const xOrb = r_new * Math.cos(th);
+        const yOrb = r_new * Math.sin(th);
+        ringPts.push(new THREE.Vector3(xOrb, yOrb * Math.sin(def.inc), yOrb * Math.cos(def.inc)));
+      }
+      const ringGeo = new THREE.BufferGeometry().setFromPoints(ringPts);
+      const ringMat = new THREE.LineBasicMaterial({ color: COLOR.maneuver, transparent: true, opacity: 0.45 });
+      const ring    = new THREE.LineLoop(ringGeo, ringMat);
+      scene.add(ring);
+      maneuverArcsRef.current[`${def.id}-ring`] = ring;
+    }
+  }, [executedAssets]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Build Three.js scene once ─────────────────────────────────
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
@@ -70,16 +168,15 @@ export default function OrbitalSimulation({ onSimEvent, running }) {
     controls.dampingFactor = 0.08;
     controls.minDistance   = 1.2;
     controls.maxDistance   = 30;
-    controls.target.set(0, 0, 0);
 
-    // Lighting
+    // Lights
     scene.add(new THREE.AmbientLight(0x223344, 2.0));
-    const sunLight = new THREE.DirectionalLight(0x99ccff, 2.5);
-    sunLight.position.set(12, 6, 5);
-    scene.add(sunLight);
-    const fillLight = new THREE.DirectionalLight(0x334466, 0.5);
-    fillLight.position.set(-6, -3, -4);
-    scene.add(fillLight);
+    const sun = new THREE.DirectionalLight(0x99ccff, 2.5);
+    sun.position.set(12, 6, 5);
+    scene.add(sun);
+    const fill = new THREE.DirectionalLight(0x334466, 0.5);
+    fill.position.set(-6, -3, -4);
+    scene.add(fill);
 
     // Stars
     const starVerts = [];
@@ -87,34 +184,68 @@ export default function OrbitalSimulation({ onSimEvent, running }) {
       const θ = Math.random() * 2 * Math.PI;
       const φ = Math.acos(2 * Math.random() - 1);
       const r = 180 + Math.random() * 20;
-      starVerts.push(
-        r * Math.sin(φ) * Math.cos(θ),
-        r * Math.sin(φ) * Math.sin(θ),
-        r * Math.cos(φ),
-      );
+      starVerts.push(r * Math.sin(φ) * Math.cos(θ), r * Math.sin(φ) * Math.sin(θ), r * Math.cos(φ));
     }
     const starGeo = new THREE.BufferGeometry();
     starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starVerts, 3));
-    const starMat = new THREE.PointsMaterial({ color: COLOR.star, size: 0.09, sizeAttenuation: true });
+    const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.09, sizeAttenuation: true });
     scene.add(new THREE.Points(starGeo, starMat));
+    toDisposeRef.current.push({ geo: starGeo, mat: starMat });
 
     // Earth
-    const earthGeo  = new THREE.SphereGeometry(1.0, 64, 32);
-    const earthMat  = new THREE.MeshPhongMaterial({
+    const earthGeo = new THREE.SphereGeometry(1.0, 64, 32);
+    const earthMat = new THREE.MeshPhongMaterial({
       color: COLOR.earth, emissive: 0x07101a, specular: 0x1a3a5c, shininess: 18,
     });
     const earthMesh = new THREE.Mesh(earthGeo, earthMat);
     scene.add(earthMesh);
+    toDisposeRef.current.push({ geo: earthGeo, mat: earthMat });
 
     const gridGeo = new THREE.SphereGeometry(1.004, 24, 12);
     const gridMat = new THREE.MeshBasicMaterial({
       color: COLOR.earthGrid, wireframe: true, transparent: true, opacity: 0.10,
     });
     scene.add(new THREE.Mesh(gridGeo, gridMat));
+    toDisposeRef.current.push({ geo: gridGeo, mat: gridMat });
 
     const eqGeo = new THREE.TorusGeometry(1.006, 0.0015, 4, 256);
     const eqMat = new THREE.MeshBasicMaterial({ color: COLOR.equator, transparent: true, opacity: 0.5 });
     scene.add(new THREE.Mesh(eqGeo, eqMat));
+    toDisposeRef.current.push({ geo: eqGeo, mat: eqMat });
+
+    // Static orbit rings
+    for (const def of SATELLITE_DEFS) {
+      const pts = [];
+      for (let i = 0; i <= 128; i++) {
+        const th   = (i / 128) * 2 * Math.PI;
+        const xOrb = def.r * Math.cos(th);
+        const yOrb = def.r * Math.sin(th);
+        pts.push(new THREE.Vector3(xOrb, yOrb * Math.sin(def.inc), yOrb * Math.cos(def.inc)));
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const col = def.type === "satellite" ? 0x004466 : 0x552200;
+      const mat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.28 });
+      scene.add(new THREE.LineLoop(geo, mat));
+      toDisposeRef.current.push({ geo, mat });
+    }
+
+    // Object meshes – start at deterministic initial positions
+    const objMeshes = {};
+    for (const def of SATELLITE_DEFS) {
+      const isSat = def.type === "satellite";
+      const geo   = new THREE.SphereGeometry(isSat ? 0.028 : 0.022, 10, 8);
+      const mat   = new THREE.MeshPhongMaterial({
+        color:             isSat ? COLOR.satellite : COLOR.debris,
+        emissive:          isSat ? COLOR.satellite : COLOR.debris,
+        emissiveIntensity: 0.6,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(orbitalPos(0, def.r, def.omega, def.phi0, def.inc));
+      scene.add(mesh);
+      objMeshes[def.id] = mesh;
+      toDisposeRef.current.push({ geo, mat });
+    }
+    objMeshesRef.current = objMeshes;
 
     // Resize observer
     const ro = new ResizeObserver(() => {
@@ -126,66 +257,74 @@ export default function OrbitalSimulation({ onSimEvent, running }) {
     });
     ro.observe(container);
 
-    // Render loop — positions are updated by the polling effect, this just renders
-    function animate() {
+    // Animation loop
+    function animate(now) {
       rafId = requestAnimationFrame(animate);
+
+      // Advance sim time only when running
+      if (runningRef.current && lastNowRef.current !== null) {
+        simTimeRef.current += (now - lastNowRef.current) / 1000;
+      }
+      lastNowRef.current = now;
+
+      const t = simTimeRef.current;
+
+      // Update satellite positions
+      for (const def of SATELLITE_DEFS) {
+        const mesh = objMeshes[def.id];
+        if (!mesh) continue;
+        // Raise orbit after maneuver
+        const r = (def.id === "SAT-01" && executedRef.current.has("SAT-01"))
+          ? def.r + 0.018
+          : def.r;
+        mesh.position.copy(orbitalPos(t, r, def.omega, def.phi0, def.inc));
+      }
+
+      // Manage conjunction lines
+      const activeConj = activeConjRef.current;
+      const activeKeys = new Set();
+
+      for (const conj of activeConj) {
+        const key = `${conj.primaryAsset}-vs-${conj.secondaryObject}`;
+        activeKeys.add(key);
+
+        const m1 = objMeshes[conj.primaryAsset];
+        const m2 = objMeshes[conj.secondaryObject];
+        if (!m1 || !m2) continue;
+
+        if (!conjLinesRef.current[key]) {
+          const geo = new THREE.BufferGeometry().setFromPoints([m1.position.clone(), m2.position.clone()]);
+          const mat = new THREE.LineBasicMaterial({ color: COLOR.conj, transparent: true, opacity: 0.75 });
+          conjLinesRef.current[key] = new THREE.Line(geo, mat);
+          scene.add(conjLinesRef.current[key]);
+        } else {
+          const pts = new Float32Array([
+            m1.position.x, m1.position.y, m1.position.z,
+            m2.position.x, m2.position.y, m2.position.z,
+          ]);
+          conjLinesRef.current[key].geometry.setAttribute(
+            "position", new THREE.Float32BufferAttribute(pts, 3),
+          );
+          conjLinesRef.current[key].geometry.attributes.position.needsUpdate = true;
+        }
+      }
+
+      // Remove stale conjunction lines
+      for (const [key, line] of Object.entries(conjLinesRef.current)) {
+        if (!activeKeys.has(key)) {
+          scene.remove(line);
+          line.geometry?.dispose();
+          line.material?.dispose();
+          delete conjLinesRef.current[key];
+        }
+      }
+
+      earthMesh.rotation.y += 0.0004;
       controls.update();
-      earthMesh.rotation.y += 0.0006;
       renderer.render(scene, camera);
     }
+
     rafId = requestAnimationFrame(animate);
-
-    // Fetch precomputed frames to build orbit rings + object meshes
-    async function fetchFrames() {
-      try {
-        const res = await fetch(`${API}/simulation/frames`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (!mounted) return;
-
-        const toDispose = toDisposeRef.current;
-
-        // Orbit rings (static — show predicted paths)
-        for (const orb of data.orbits ?? []) {
-          const pts = orb.points.map(([x, y, z]) => eciKmToScene(x, y, z));
-          const geo = new THREE.BufferGeometry().setFromPoints(pts);
-          const col = orb.type === "satellite" ? 0x004466 : 0x552200;
-          const mat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.35 });
-          const line = new THREE.LineLoop(geo, mat);
-          scene.add(line);
-          toDispose.push({ geo, mat });
-        }
-
-        // Object spheres (positions updated by polling)
-        for (const obj of data.metadata?.objects ?? []) {
-          const isSat = obj.type === "satellite";
-          const geo   = new THREE.SphereGeometry(isSat ? 0.028 : 0.022, 10, 8);
-          const mat   = new THREE.MeshPhongMaterial({
-            color:             isSat ? COLOR.satellite : COLOR.debris,
-            emissive:          isSat ? COLOR.satellite : COLOR.debris,
-            emissiveIntensity: 0.6,
-          });
-          const mesh = new THREE.Mesh(geo, mat);
-          scene.add(mesh);
-          toDispose.push({ geo, mat });
-          objMeshesRef.current[obj.id] = mesh;
-        }
-
-        if (mounted) {
-          setSimStatus("paused");
-          setFrameInfo(fi => ({
-            ...fi,
-            total:   data.metadata?.numFrames  ?? 0,
-            objects: data.metadata?.numObjects ?? 0,
-          }));
-        }
-      } catch (err) {
-        if (!mounted) return;
-        console.error("[OrbitalSim] fetchFrames error:", err);
-        setSimStatus("error");
-      }
-    }
-    fetchFrames();
 
     return () => {
       mounted = false;
@@ -193,175 +332,64 @@ export default function OrbitalSimulation({ onSimEvent, running }) {
       ro.disconnect();
       controls.dispose();
       for (const { geo, mat } of toDisposeRef.current) { geo?.dispose(); mat?.dispose(); }
-      earthGeo.dispose(); earthMat.dispose();
-      gridGeo.dispose();  gridMat.dispose();
-      eqGeo.dispose();    eqMat.dispose();
-      starGeo.dispose();  starMat.dispose();
+      for (const line of Object.values(conjLinesRef.current)) {
+        line.geometry?.dispose(); line.material?.dispose();
+      }
+      for (const line of Object.values(maneuverArcsRef.current)) {
+        line.geometry?.dispose(); line.material?.dispose();
+      }
       renderer.dispose();
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Poll /simulation/state when running ─────────────────────────────────────
-  useEffect(() => {
-    if (!running) {
-      setSimStatus(s => s === "live" ? "paused" : s);
-      return;
-    }
-
-    setSimStatus("live");
-
-    const poll = async () => {
-      try {
-        const res = await fetch(`${API}/simulation/state`);
-        if (!res.ok) return;
-        const state = await res.json();
-
-        // Update object positions from current simulation frame
-        const objMeshes = objMeshesRef.current;
-        for (const obj of state.objects ?? []) {
-          const mesh = objMeshes[obj.id];
-          if (!mesh) continue;
-          const [x, y, z] = obj.position;
-          mesh.position.copy(eciKmToScene(x, y, z));
-        }
-
-        setFrameInfo({
-          frame:   state.frame_idx ?? 0,
-          t:       state.t        ?? 0,
-          total:   state.total_frames ?? 0,
-          objects: (state.objects ?? []).length,
-        });
-
-        const scene = sceneRef.current;
-        const ev    = state.active_event;
-
-        // Manage conjunction line
-        if (scene) {
-          if (conjLineRef.current && !ev) {
-            // Event resolved — remove line
-            scene.remove(conjLineRef.current);
-            conjLineRef.current.geometry.dispose();
-            conjLineRef.current.material.dispose();
-            conjLineRef.current = null;
-            setEventInfo(null);
-          }
-
-          if (ev) {
-            const m1 = objMeshes[ev.primaryAsset];
-            const m2 = objMeshes[ev.secondaryObject];
-            if (m1 && m2) {
-              if (!conjLineRef.current) {
-                // Create new conjunction line
-                const geo = new THREE.BufferGeometry().setFromPoints([
-                  m1.position.clone(), m2.position.clone(),
-                ]);
-                const mat  = new THREE.LineBasicMaterial({ color: COLOR.conj, transparent: true, opacity: 0.75 });
-                const line = new THREE.Line(geo, mat);
-                scene.add(line);
-                conjLineRef.current = line;
-                toDisposeRef.current.push({ geo, mat });
-              } else {
-                // Update existing line to follow moving objects
-                const pts = new Float32Array([
-                  m1.position.x, m1.position.y, m1.position.z,
-                  m2.position.x, m2.position.y, m2.position.z,
-                ]);
-                conjLineRef.current.geometry.setAttribute(
-                  "position", new THREE.Float32BufferAttribute(pts, 3),
-                );
-                conjLineRef.current.geometry.attributes.position.needsUpdate = true;
-              }
-            }
-
-            // Fire onSimEvent once per unique event
-            const evId = ev.tDetected ?? ev.tca ?? "event";
-            if (evId !== lastEventIdRef.current) {
-              lastEventIdRef.current = evId;
-              setEventInfo(ev);
-              onSimEventRef.current?.(ev);
-            }
-          }
-        }
-      } catch (err) {
-        console.error("[OrbitalSim] poll error:", err);
-      }
-    };
-
-    const id = setInterval(poll, 500);
-    return () => clearInterval(id);
-  }, [running]);
-
-  // ── Status overlay text ──────────────────────────────────────────────────────
-  const topLine =
-    simStatus === "live"
-      ? `T+${frameInfo.t.toFixed(0)} s  |  Frame ${frameInfo.frame + 1}/${frameInfo.total}  |  ${frameInfo.objects} objects`
-      : simStatus === "error"
-      ? "Sim: offline — check backend"
-      : simStatus === "paused"
-      ? "Simulation paused — press Start to begin"
-      : "Sim: connecting…";
-
   return (
     <div className="flex-1 min-w-0 bg-[#00000a] rounded-2xl border border-neutral-800 relative overflow-hidden">
-
-      {/* Three.js canvas */}
       <div ref={mountRef} className="absolute inset-0" />
 
-      {/* Loading banner */}
-      {simStatus === "loading" && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
-          <p className="text-cyan-400 font-mono text-xs tracking-widest animate-pulse">
-            LOADING ORBITAL DATA…
-          </p>
-        </div>
-      )}
-
-      {/* Telemetry header */}
+      {/* Status header */}
       <div className="absolute top-0 left-0 right-0 z-10 px-6 pt-4 text-center pointer-events-none select-none">
         <p className="text-xs text-neutral-200 font-mono tracking-wide">
-          {topLine}&nbsp;&nbsp;|&nbsp;&nbsp;Regime: LEO&nbsp;&nbsp;|&nbsp;&nbsp;Earth Orbital Simulation
+          {running ? "Simulation live" : "Simulation paused"}
+          &nbsp;&nbsp;|&nbsp;&nbsp;Regime: LEO&nbsp;&nbsp;|&nbsp;&nbsp;Earth Orbital Simulation
         </p>
         <p className="text-[11px] text-cyan-400/80 font-mono mt-0.5">
-          Physics: Keplerian propagation · real CelesTrak TLE elements
-        </p>
-        <p className="text-[10px] text-neutral-500 font-mono mt-0.5">
-          Renderer: Three.js&nbsp;&nbsp;|&nbsp;&nbsp;dt = 30 s&nbsp;&nbsp;|&nbsp;&nbsp;Scale: 1 unit = 1 R⊕
+          Physics: Keplerian propagation · LEO constellation · Scale: 1 unit = 1 R⊕
         </p>
       </div>
 
-      {/* SIM DASHBOARD */}
+      {/* Dashboard */}
       <div className="absolute top-4 right-4 z-10 bg-neutral-950/85 border border-neutral-700/50 rounded-lg px-3.5 py-3 backdrop-blur-sm pointer-events-none select-none">
         <p className="text-[9px] text-neutral-500 uppercase tracking-widest mb-2 font-semibold">
           SIM DASHBOARD
         </p>
         <div className="space-y-0.5 text-[10px] font-mono text-neutral-400">
-          <p>Objects: <span className="text-neutral-200">{frameInfo.objects || "—"}</span></p>
-          <p>Frames:  <span className="text-neutral-200">{frameInfo.total   || "—"}</span></p>
-          <p>SAT-01:  <span className="text-cyan-400">HST · LEO 485 km</span></p>
-          <p>Hazard:  <span className="text-orange-400">COSMOS 2251 DEB</span></p>
-          <p>Sim time: <span className="text-neutral-200">
-            {simStatus === "live" ? `${frameInfo.t.toFixed(0)} s` : "—"}
+          <p>Objects: <span className="text-neutral-200">{SATELLITE_DEFS.length}</span></p>
+          <p>SAT-01: <span className="text-cyan-400">LEO 475 km</span></p>
+          <p>SAT-03: <span className="text-cyan-400">LEO 415 km</span></p>
+          <p>Hazards: <span className="text-orange-400">2 debris tracked</span></p>
+          <p>Status: <span className={running ? "text-green-400" : "text-amber-400"}>
+            {running ? "live" : "paused"}
           </span></p>
-          <p>Status: <span className={
-            simStatus === "live"   ? "text-green-400" :
-            simStatus === "error"  ? "text-red-400"   :
-            simStatus === "paused" ? "text-amber-400"  : "text-yellow-400"
-          }>{simStatus}</span></p>
         </div>
 
-        {eventInfo && (
+        {activeConjunctions && activeConjunctions.length > 0 && (
           <div className="mt-2 pt-2 border-t border-neutral-700/40">
-            <p className="text-[9px] text-red-400 uppercase tracking-widest mb-1">⚠ Conjunction</p>
-            <p className="text-[10px] font-mono text-red-300">
-              Pc = {(eventInfo.collisionProbability * 100).toFixed(0)}%
-            </p>
-            <p className="text-[10px] font-mono text-red-300">
-              {eventInfo.closestApproachDistanceM?.toFixed(0)} m miss
-            </p>
-            <p className="text-[10px] font-mono text-red-300">
-              TCA: {eventInfo.timeToTca}
-            </p>
+            <p className="text-[9px] text-red-400 uppercase tracking-widest mb-1">⚠ Active Conjunctions</p>
+            {activeConjunctions.map((c, i) => (
+              <p key={i} className="text-[10px] font-mono text-red-300">
+                {c.primaryAsset} / {c.secondaryObject.split(" ").slice(0, 2).join(" ")}
+              </p>
+            ))}
+          </div>
+        )}
+
+        {executedAssets && executedAssets.size > 0 && (
+          <div className="mt-2 pt-2 border-t border-neutral-700/40">
+            <p className="text-[9px] text-green-400 uppercase tracking-widest mb-1">✓ Maneuver Executed</p>
+            {[...executedAssets].map((a) => (
+              <p key={a} className="text-[10px] font-mono text-green-300">{a} trajectory adjusted</p>
+            ))}
           </div>
         )}
       </div>
@@ -371,10 +399,10 @@ export default function OrbitalSimulation({ onSimEvent, running }) {
         <p className="text-[9px] font-mono text-neutral-600 uppercase tracking-widest mb-1">Legend</p>
         <p className="text-[10px] font-mono"><span className="text-cyan-400">●</span> Satellite</p>
         <p className="text-[10px] font-mono"><span className="text-orange-400">●</span> Debris</p>
-        <p className="text-[10px] font-mono"><span className="text-red-400">—</span> Conjunction path</p>
+        <p className="text-[10px] font-mono"><span className="text-red-400">—</span> Conjunction</p>
+        <p className="text-[10px] font-mono"><span className="text-green-400">—</span> Maneuver arc</p>
         <p className="text-[10px] font-mono text-neutral-600 mt-1">Drag to rotate · Scroll to zoom</p>
       </div>
-
     </div>
   );
 }

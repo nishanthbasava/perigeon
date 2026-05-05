@@ -166,6 +166,32 @@ const DEMO_SCENARIO = {
   riskLevel:         "High",
 };
 
+// Deterministic demo events — fired at fixed wall-clock seconds after sim start
+const DEMO_EVENTS = [
+  {
+    id:                     "collision-001",
+    triggerSecs:            5,
+    primaryAsset:           "SAT-01",
+    secondaryObject:        "COSMOS 2251 DEB",
+    pc:                     0.82,
+    tca:                    "00:04:22",
+    closestApproachDistanceM: 84,
+    relativeSpeedKms:       14.2,
+    riskLevel:              "High",
+  },
+  {
+    id:                     "collision-002",
+    triggerSecs:            15,
+    primaryAsset:           "SAT-03",
+    secondaryObject:        "IRIDIUM 33 DEB",
+    pc:                     0.74,
+    tca:                    "00:05:10",
+    closestApproachDistanceM: 126,
+    relativeSpeedKms:       11.8,
+    riskLevel:              "Medium-High",
+  },
+];
+
 // Zero-padded step number from 0-based array index
 function getStepNumber(index) {
   return String(index + 1).padStart(2, "0");
@@ -390,6 +416,32 @@ function downloadHtmlReport(html, filename) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ─── Per-event feature builder ────────────────────────────────────
+
+function buildFeaturesForCollision(evDef) {
+  return [
+    { feature_group: "llm", feature_name: "risk_class",               value: evDef.riskLevel.toUpperCase().replace(/-/g, "_") },
+    { feature_group: "llm", feature_name: "collision_probability",    value: String(evDef.pc) },
+    { feature_group: "llm", feature_name: "time_to_closest_approach", value: "262" },
+    { feature_group: "llm", feature_name: "miss_distance_m",          value: String(evDef.closestApproachDistanceM) },
+    { feature_group: "llm", feature_name: "target_satellite",         value: evDef.primaryAsset },
+    { feature_group: "llm", feature_name: "hazard_object",            value: evDef.secondaryObject.replace(/ /g, "-") },
+    { feature_group: "llm", feature_name: "can_maneuver",             value: "yes" },
+    { feature_group: "llm", feature_name: "delta_v_budget",           value: "2.1 m/s" },
+    { feature_group: "llm", feature_name: "fuel_remaining",           value: "38%" },
+    { feature_group: "llm", feature_name: "thruster_status",          value: "nominal" },
+    { feature_group: "llm", feature_name: "allowed_maneuver_types",   value: "prograde, radial" },
+    { feature_group: "llm", feature_name: "power_risk",               value: "low" },
+    { feature_group: "llm", feature_name: "thermal_risk",             value: "low" },
+    { feature_group: "llm", feature_name: "communication_available",  value: "yes" },
+    { feature_group: "llm", feature_name: "communication_risk",       value: "low" },
+    { feature_group: "llm", feature_name: "sensor_confidence",        value: "0.92" },
+    { feature_group: "llm", feature_name: "trust_level",              value: "high" },
+    { feature_group: "llm", feature_name: "safe_autonomous_control",  value: "yes" },
+    { feature_group: "ml",  feature_name: "raw_pc",                   value: String(evDef.pc) },
+  ];
 }
 
 // ─── Collision summary builder ────────────────────────────────────
@@ -719,18 +771,140 @@ function CollisionSummary({ text }) {
   );
 }
 
+// ─── Collision Group (left panel card per event) ───────────────────
+
+function CollisionGroup({ collision, index, expanded, isSelected, onToggle, onSelect }) {
+  const [expandedSteps, setExpandedSteps] = useState(new Set());
+
+  const statusLabel =
+    collision.status === "resolved" ? "Resolved" :
+    collision.status === "active"   ? "Active"   : "Pending";
+
+  const statusColor =
+    collision.status === "resolved" ? "text-green-400" :
+    collision.status === "active"   ? "text-amber-400" : "text-neutral-500";
+
+  const borderColor = isSelected
+    ? "border-cyan-500/30"
+    : collision.status === "active" ? "border-amber-500/15" : "border-white/5";
+
+  function toggleStep(i) {
+    setExpandedSteps(prev => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+  }
+
+  return (
+    <div className={`border ${borderColor} rounded-xl overflow-hidden mb-2`}>
+      {/* Group header */}
+      <button
+        onClick={() => { onToggle(); onSelect(); }}
+        className="w-full px-4 py-3 text-left hover:bg-white/2 transition-colors"
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-neutral-100 leading-snug">
+              Collision {index} — {collision.primaryAsset} vs {collision.secondaryObject}
+            </p>
+            <p className={`text-[10px] mt-0.5 ${statusColor}`}>
+              Status: {statusLabel}
+            </p>
+            <p className="text-[10px] text-neutral-500 mt-0.5">
+              Pc: {collision.pc} · TCA: {collision.tca}
+            </p>
+          </div>
+          <span className="text-[10px] text-neutral-600 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
+        </div>
+      </button>
+
+      {/* Expanded body */}
+      {expanded && (
+        <div className="border-t border-white/5 px-4 py-3 space-y-3">
+
+          {/* Scenario snapshot */}
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 p-2.5 bg-neutral-900/60 rounded-lg text-[10px]">
+            <div>
+              <p className="text-neutral-600 uppercase tracking-widest text-[9px]">Risk</p>
+              <p className="text-amber-400 font-mono mt-0.5">{collision.riskLevel}</p>
+            </div>
+            <div>
+              <p className="text-neutral-600 uppercase tracking-widest text-[9px]">Miss distance</p>
+              <p className="text-neutral-300 font-mono mt-0.5">{collision.closestApproachDistanceM} m</p>
+            </div>
+            <div>
+              <p className="text-neutral-600 uppercase tracking-widest text-[9px]">Rel. speed</p>
+              <p className="text-neutral-300 font-mono mt-0.5">{collision.relativeSpeedKms} km/s</p>
+            </div>
+            <div>
+              <p className="text-neutral-600 uppercase tracking-widest text-[9px]">Pc</p>
+              <p className="text-red-400 font-mono mt-0.5">{collision.pc}</p>
+            </div>
+          </div>
+
+          {/* Loading spinner */}
+          {collision.agendaStatus === "loading" && (
+            <div className="flex items-center gap-2 py-1">
+              <div className="w-3.5 h-3.5 rounded-full border border-cyan-500/30 border-t-cyan-400 animate-spin shrink-0" />
+              <p className="text-[11px] text-neutral-500">Running agenda pipeline…</p>
+            </div>
+          )}
+
+          {/* Reasoning steps */}
+          {collision.agendaStatus === "done" && collision.reasoningSteps.length > 0 && (
+            <div className="space-y-1.5">
+              <p className="text-[9px] text-neutral-600 uppercase tracking-widest">Reasoning trace</p>
+              {collision.reasoningSteps.map((step, i) => (
+                <ProcessStep
+                  key={i}
+                  step={step}
+                  index={i}
+                  expanded={expandedSteps.has(i)}
+                  onToggle={() => toggleStep(i)}
+                />
+              ))}
+            </div>
+          )}
+
+          {/* Error */}
+          {collision.agendaStatus === "error" && (
+            <p className="text-[11px] text-red-400">Pipeline error: {collision.errorMsg}</p>
+          )}
+
+          {/* Collision summary */}
+          {collision.collisionSummary && (
+            <CollisionSummary text={collision.collisionSummary} />
+          )}
+
+          {/* Maneuver executed note */}
+          {collision.maneuverExecuted && (
+            <p className="text-[11px] text-green-400/80 leading-relaxed">
+              Avoidance maneuver executed. Trajectory adjusted to increase projected miss distance.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Left Panel ───────────────────────────────────────────────────
 
-function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg, csvState, onUploadCSV, csvFileRef, collisionSummary }) {
-  const statusPill =
-    status === "loading" ? "Processing" :
-    status === "done"    ? "Complete"   :
-    status === "error"   ? "Error"      : "Idle";
+function LeftPanel({
+  style, collisions, selectedCollisionId, expandedCollisionIds,
+  onSelectCollision, onToggleCollision, onGenerate, csvState, csvFileRef, onUploadCSV,
+}) {
+  const activeCount   = collisions.filter(c => c.status === "active").length;
+  const resolvedCount = collisions.filter(c => c.status === "resolved").length;
+
+  const pillLabel =
+    activeCount > 0  ? `${activeCount} active` :
+    collisions.length > 0 ? "Monitoring"       : "Idle";
 
   const pillColor =
-    status === "loading" ? "border-cyan-500/30 text-cyan-400/80" :
-    status === "done"    ? "border-green-500/30 text-green-400/80" :
-    status === "error"   ? "border-red-500/30 text-red-400/80"   :
+    activeCount > 0  ? "border-amber-500/30 text-amber-400/80" :
+    collisions.length > 0 ? "border-green-500/30 text-green-400/80" :
     "border-white/10 text-neutral-500";
 
   return (
@@ -743,17 +917,21 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
         <div className="flex items-center justify-between mb-0.5">
           <h2 className="text-sm font-medium text-neutral-100 font-mono-tech">Q-Router Copilot</h2>
           <span className={`text-[10px] border rounded-full px-2 py-0.5 leading-4 ${pillColor}`}>
-            {statusPill}
+            {pillLabel}
           </span>
         </div>
-        <p className="text-xs text-neutral-500">Flight dynamics reasoning</p>
+        <p className="text-xs text-neutral-500">
+          {collisions.length > 0
+            ? `${collisions.length} collision event${collisions.length > 1 ? "s" : ""}${resolvedCount > 0 ? ` · ${resolvedCount} resolved` : ""}`
+            : "Flight dynamics reasoning"}
+        </p>
       </div>
 
-      {/* Content area */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 min-h-0">
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 min-h-0">
 
-        {/* Idle: static steps */}
-        {status === "idle" && (
+        {/* Idle — sim not started */}
+        {collisions.length === 0 && (
           <>
             <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-4">
               Active reasoning
@@ -766,50 +944,28 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
           </>
         )}
 
-        {/* Loading: spinner */}
-        {status === "loading" && (
-          <div className="flex flex-col items-center justify-center h-full gap-4 py-12">
-            <div className="w-6 h-6 rounded-full border-2 border-cyan-500/30 border-t-cyan-400 animate-spin" />
-            <p className="text-xs text-neutral-500 text-center">Running agenda pipeline…</p>
-          </div>
-        )}
-
-        {/* Done: process steps from API + collision summary */}
-        {status === "done" && reasoningSteps.length > 0 && (
-          <>
-            <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-3">
-              Reasoning trace
+        {/* Collision groups */}
+        {collisions.length > 0 && (
+          <div>
+            <p className="text-[9px] text-neutral-600 uppercase tracking-widest font-medium mb-3">
+              Conjunction events
             </p>
-            <div className="space-y-2">
-              {reasoningSteps.slice(0, revealedCount).map((step, i) => (
-                <ProcessStep
-                  key={i}
-                  step={step}
-                  index={i}
-                  expanded={expandedSteps.has(i)}
-                  onToggle={() => onToggleStep(i)}
-                />
-              ))}
-            </div>
-            {revealedCount >= reasoningSteps.length && (
-              <CollisionSummary text={collisionSummary} />
-            )}
-          </>
-        )}
-
-        {/* Error */}
-        {status === "error" && (
-          <div className="py-6">
-            <p className="text-sm text-red-400 mb-1">Request failed</p>
-            <p className="text-xs text-neutral-500 leading-relaxed">{errorMsg}</p>
-            <p className="text-xs text-neutral-600 mt-3">
-              Make sure the backend is running and the vector DB is built.
-            </p>
+            {collisions.map((collision, i) => (
+              <CollisionGroup
+                key={collision.id}
+                collision={collision}
+                index={i + 1}
+                expanded={expandedCollisionIds.has(collision.id)}
+                isSelected={selectedCollisionId === collision.id}
+                onToggle={() => onToggleCollision(collision.id)}
+                onSelect={() => onSelectCollision(collision.id)}
+              />
+            ))}
           </div>
         )}
       </div>
 
-      {/* Actions */}
+      {/* Actions footer */}
       <div className="px-5 pt-2 pb-3 shrink-0">
         <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-2.5">
           Suggested actions
@@ -817,12 +973,10 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
         <div className="flex flex-wrap gap-1.5 mb-3">
           <button
             onClick={() => onGenerate()}
-            disabled={status === "loading"}
-            className="text-xs px-3 py-1 rounded-full border border-cyan-500/30 text-cyan-400/80 hover:border-cyan-500/50 hover:text-cyan-300 transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            className="text-xs px-3 py-1 rounded-full border border-cyan-500/30 text-cyan-400/80 hover:border-cyan-500/50 hover:text-cyan-300 transition-colors duration-150 cursor-pointer"
           >
             Generate agendas
           </button>
-          {/* Hidden file input — triggered by the Upload CSV button below */}
           <input
             ref={csvFileRef}
             type="file"
@@ -832,8 +986,7 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
           />
           <button
             onClick={() => csvFileRef.current?.click()}
-            disabled={status === "loading"}
-            className="text-xs px-3 py-1 rounded-full border border-white/10 text-neutral-400 hover:border-white/20 hover:text-neutral-200 transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            className="text-xs px-3 py-1 rounded-full border border-white/10 text-neutral-400 hover:border-white/20 hover:text-neutral-200 transition-colors duration-150 cursor-pointer"
           >
             Upload CSV
           </button>
@@ -847,14 +1000,11 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
           ))}
         </div>
 
-        {/* CSV status feedback */}
         {csvState.filename && (
           <p className="text-[10px] text-neutral-500 mb-1.5 truncate">
             <span className="text-neutral-600">CSV: </span>
             <span className="font-mono text-neutral-400">{csvState.filename}</span>
-            {csvState.error && (
-              <span className="text-red-400 ml-2">{csvState.error}</span>
-            )}
+            {csvState.error && <span className="text-red-400 ml-2">{csvState.error}</span>}
           </p>
         )}
         {!csvState.filename && csvState.error && (
@@ -862,7 +1012,7 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
         )}
       </div>
 
-      {/* Input */}
+      {/* Chat input */}
       <div className="px-5 pb-5 shrink-0">
         <div className="bg-neutral-900/70 border border-white/10 rounded-xl px-3.5 py-3 focus-within:border-white/20 transition-colors">
           <input
@@ -870,9 +1020,7 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
             placeholder="Ask for a maneuver plan…"
           />
           <div className="flex items-center justify-between mt-2.5">
-            <span className="text-[10px] text-neutral-600">
-              Draft outputs require analyst review.
-            </span>
+            <span className="text-[10px] text-neutral-600">Draft outputs require analyst review.</span>
             <button className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors duration-150 cursor-pointer">
               Send
             </button>
@@ -900,17 +1048,25 @@ function ReviewRow({ title }) {
   );
 }
 
-function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda, onExecuteAgenda }) {
+function RightPanel({ style, selectedCollision, expandedAgendas, onToggleAgenda, onExecuteAgenda }) {
+  const status  = selectedCollision?.agendaStatus ?? "idle";
+  const agendas = selectedCollision?.agendas ?? [];
+
   const pillLabel =
-    status === "done"    ? `${agendas.length} plans` :
-    status === "loading" ? "Generating…"             :
-    status === "error"   ? "Error"                   : "Awaiting plan";
+    !selectedCollision            ? "No selection" :
+    status === "done"             ? `${agendas.length} plans` :
+    status === "loading"          ? "Generating…"  :
+    status === "error"            ? "Error"        : "Awaiting plan";
 
   const pillColor =
     status === "done"    ? "border-green-500/30 text-green-400/80" :
     status === "loading" ? "border-cyan-500/30 text-cyan-400/80"   :
     status === "error"   ? "border-red-500/30 text-red-400/80"     :
     "border-white/10 text-neutral-500";
+
+  const subtitle = selectedCollision
+    ? `${selectedCollision.primaryAsset} vs ${selectedCollision.secondaryObject}`
+    : "Human-in-the-loop review";
 
   return (
     <div
@@ -925,24 +1081,21 @@ function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda, o
             {pillLabel}
           </span>
         </div>
-        <p className="text-xs text-neutral-500">Human-in-the-loop review</p>
+        <p className="text-xs text-neutral-500 truncate">{subtitle}</p>
+        {selectedCollision?.status === "resolved" && (
+          <p className="text-[10px] text-green-400/70 mt-0.5">Maneuver executed — collision resolved</p>
+        )}
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-5 py-5 min-h-0">
 
-        {/* Idle / loading empty state */}
-        {(status === "idle" || status === "loading") && (
+        {/* No collision selected */}
+        {!selectedCollision && (
           <>
-            <p className="text-sm text-neutral-400 leading-relaxed">
-              {status === "loading"
-                ? "Generating maneuver plans…"
-                : "No maneuver plan generated yet."}
-            </p>
+            <p className="text-sm text-neutral-400 leading-relaxed">No collision selected.</p>
             <p className="text-xs text-neutral-600 mt-1.5 leading-relaxed">
-              {status === "idle"
-                ? "Click \"Generate agendas\" to run the full pipeline."
-                : "Results will appear here when complete."}
+              Start the simulation to detect conjunction events, or click a collision group on the left.
             </p>
             <div className="h-px bg-white/5 mt-5 mb-1" />
             <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium py-3">
@@ -954,18 +1107,24 @@ function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda, o
           </>
         )}
 
+        {/* Loading */}
+        {selectedCollision && status === "loading" && (
+          <>
+            <p className="text-sm text-neutral-400 leading-relaxed">Generating maneuver plans…</p>
+            <p className="text-xs text-neutral-600 mt-1.5">Results will appear here when complete.</p>
+          </>
+        )}
+
         {/* Error */}
-        {status === "error" && (
+        {selectedCollision && status === "error" && (
           <div className="py-4">
             <p className="text-sm text-red-400">Pipeline failed</p>
-            <p className="text-xs text-neutral-600 mt-1.5">
-              Check the left panel for details.
-            </p>
+            <p className="text-xs text-neutral-600 mt-1.5">Check the left panel for details.</p>
           </div>
         )}
 
         {/* Agendas */}
-        {status === "done" && agendas.length > 0 && (
+        {selectedCollision && status === "done" && agendas.length > 0 && (
           <div className="space-y-3">
             <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-1">
               Ranked agenda options
@@ -977,15 +1136,23 @@ function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda, o
                 rank={i + 1}
                 expanded={expandedAgendas.has(i)}
                 onToggle={() => onToggleAgenda(i)}
-                onExecute={onExecuteAgenda}
+                onExecute={(ag) => onExecuteAgenda(selectedCollision.id, ag)}
               />
             ))}
           </div>
         )}
+
+        {/* Idle for selected collision */}
+        {selectedCollision && status === "idle" && (
+          <>
+            <p className="text-sm text-neutral-400 leading-relaxed">No agendas generated yet.</p>
+            <p className="text-xs text-neutral-600 mt-1.5">Click "Generate agendas" to run the pipeline.</p>
+          </>
+        )}
       </div>
 
-      {/* Action buttons */}
-      {status !== "done" && (
+      {/* Action buttons when no agendas yet */}
+      {(!selectedCollision || (status !== "done")) && (
         <div className="px-5 pb-5 pt-3 space-y-2 shrink-0">
           <button className="w-full py-2 rounded-xl border border-amber-500/20 text-amber-400/60 text-sm hover:border-amber-500/35 hover:text-amber-300 transition-colors duration-150 cursor-pointer">
             Approve plan
@@ -1026,23 +1193,28 @@ const RIGHT_MIN = 260;
 const RIGHT_MAX = 540;
 
 export default function App() {
-  const [leftWidth, setLeftWidth]   = useState(340);
-  const [rightWidth, setRightWidth] = useState(360);
+  const [leftWidth, setLeftWidth]   = useState(360);
+  const [rightWidth, setRightWidth] = useState(380);
   const [simRunning, setSimRunning] = useState(false);
+  const [simResetKey, setSimResetKey] = useState(0);
 
-  // Agenda pipeline state
-  const [agendaStatus, setAgendaStatus]         = useState("idle"); // idle | loading | done | error
-  const [reasoningSteps, setReasoningSteps]     = useState([]);
-  const [agendas, setAgendas]                   = useState([]);
-  const [collisionSummary, setCollisionSummary] = useState("");
-  const [errorMsg, setErrorMsg]                 = useState("");
-  const [revealedCount, setRevealedCount]       = useState(0);
-  const [expandedSteps, setExpandedSteps]       = useState(new Set());
-  const [expandedAgendas, setExpandedAgendas]   = useState(new Set([0])); // first expanded by default
+  // Per-collision state
+  const [collisions, setCollisions]               = useState([]);
+  const [selectedCollisionId, setSelectedCollisionId] = useState(null);
+  const [expandedCollisionIds, setExpandedCollisionIds] = useState(new Set());
+  // expandedAgendasMap: { [collisionId]: Set<number> }
+  const [expandedAgendasMap, setExpandedAgendasMap] = useState({});
+  // executedAssets passed to OrbitalSimulation for visual update
+  const [executedAssets, setExecutedAssets]       = useState(new Set());
 
   // CSV upload state
   const [csvState, setCsvState] = useState({ filename: "", error: "" });
   const csvFileRef = useRef(null);
+
+  // Demo timer refs
+  const simStartTimeRef  = useRef(null);   // wall clock ms when sim started
+  const simElapsedMsRef  = useRef(0);      // accumulated ms before pause
+  const createdEventsRef = useRef(new Set());
 
   // Panel resize
   const dragging   = useRef(null);
@@ -1050,8 +1222,8 @@ export default function App() {
   const startWidth = useRef(0);
 
   const handleDividerMouseDown = (side, e) => {
-    dragging.current  = side;
-    startX.current    = e.clientX;
+    dragging.current   = side;
+    startX.current     = e.clientX;
     startWidth.current = side === "left" ? leftWidth : rightWidth;
     document.body.style.userSelect = "none";
     e.preventDefault();
@@ -1072,184 +1244,262 @@ export default function App() {
       document.body.style.userSelect = "";
     };
     window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mouseup",  onMouseUp);
     return () => {
       window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mouseup",  onMouseUp);
     };
   }, []);
 
-  // Reveal reasoning steps one-by-one after data loads
-  useEffect(() => {
-    if (agendaStatus !== "done" || reasoningSteps.length === 0) return;
-    if (revealedCount >= reasoningSteps.length) return;
-    const t = setTimeout(() => setRevealedCount((c) => c + 1), 200);
-    return () => clearTimeout(t);
-  }, [agendaStatus, reasoningSteps, revealedCount]);
-
-  // Generate agendas — accepts optional uploadedFeatures; falls back to SAMPLE_COLLISION
-  const handleGenerateAgendas = useCallback(async (featuresOverride) => {
-    setAgendaStatus("loading");
-    setReasoningSteps([]);
-    setAgendas([]);
-    setCollisionSummary("");
-    setErrorMsg("");
-    setRevealedCount(0);
-    setExpandedSteps(new Set());
-    setExpandedAgendas(new Set([0]));
-
-    const payload = featuresOverride
-      ? { features: featuresOverride }
-      : SAMPLE_COLLISION;
-
-    console.log("[q-router] sending features payload:", payload);
-
+  // ── Generate agendas for a given collision event ──────────────
+  const generateAgendasForCollision = useCallback(async (collisionId, evDef) => {
+    const features = buildFeaturesForCollision(evDef);
     try {
       const res = await fetch("http://127.0.0.1:8000/generate-agendas-from-collision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ features }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail ?? `HTTP ${res.status}`);
       }
       const data = await res.json();
-      console.log("[q-router] backend response:", data);
       const receivedAgendas = data.agendas ?? [];
-      setReasoningSteps(data.reasoning_steps ?? []);
-      setAgendas(receivedAgendas);
-      setCollisionSummary(buildCollisionSummary(receivedAgendas));
-      setAgendaStatus("done");
+      setCollisions(prev => prev.map(c => c.id !== collisionId ? c : {
+        ...c,
+        agendaStatus:     "done",
+        reasoningSteps:   data.reasoning_steps ?? [],
+        agendas:          receivedAgendas,
+        collisionSummary: buildCollisionSummary(receivedAgendas),
+      }));
+      // Initialize first agenda expanded
+      setExpandedAgendasMap(prev => ({ ...prev, [collisionId]: new Set([0]) }));
     } catch (e) {
-      setErrorMsg(e.message ?? "Unknown error");
-      setAgendaStatus("error");
+      setCollisions(prev => prev.map(c => c.id !== collisionId ? c : {
+        ...c,
+        agendaStatus: "error",
+        errorMsg:     e.message ?? "Unknown error",
+      }));
     }
   }, []);
 
-  // Sim event handler — called by OrbitalSimulation when a conjunction is detected
-  const handleSimEvent = useCallback((ev) => {
-    const pc = String(ev.collisionProbability ?? 0.82);
-    const features = [
-      { feature_group: "llm", feature_name: "risk_class",               value: (ev.riskLevel ?? "HIGH").toUpperCase() },
-      { feature_group: "llm", feature_name: "collision_probability",    value: pc },
-      { feature_group: "llm", feature_name: "time_to_closest_approach", value: "262" },
-      { feature_group: "llm", feature_name: "miss_distance_m",          value: String(ev.closestApproachDistanceM ?? ev.missDistanceM ?? 84) },
-      { feature_group: "llm", feature_name: "target_satellite",         value: ev.primaryAsset ?? "SAT-01" },
-      { feature_group: "llm", feature_name: "hazard_object",            value: ev.secondaryObject ?? "COSMOS-DEB-01" },
-      { feature_group: "llm", feature_name: "can_maneuver",             value: "yes" },
-      { feature_group: "llm", feature_name: "delta_v_budget",           value: "2.1 m/s" },
-      { feature_group: "llm", feature_name: "fuel_remaining",           value: "38%" },
-      { feature_group: "llm", feature_name: "thruster_status",          value: "nominal" },
-      { feature_group: "llm", feature_name: "allowed_maneuver_types",   value: "prograde, radial" },
-      { feature_group: "llm", feature_name: "power_risk",               value: "low" },
-      { feature_group: "llm", feature_name: "thermal_risk",             value: "low" },
-      { feature_group: "llm", feature_name: "communication_available",  value: "yes" },
-      { feature_group: "llm", feature_name: "communication_risk",       value: "low" },
-      { feature_group: "llm", feature_name: "sensor_confidence",        value: "0.92" },
-      { feature_group: "llm", feature_name: "trust_level",              value: "high" },
-      { feature_group: "llm", feature_name: "safe_autonomous_control",  value: "yes" },
-      { feature_group: "ml",  feature_name: "raw_pc",                   value: pc },
-    ];
-    handleGenerateAgendas(features);
-  }, [handleGenerateAgendas]);
+  // ── Create a new collision from a demo event definition ────────
+  const triggerCollisionEvent = useCallback((evDef) => {
+    const newCollision = {
+      id:                       evDef.id,
+      primaryAsset:             evDef.primaryAsset,
+      secondaryObject:          evDef.secondaryObject,
+      pc:                       evDef.pc,
+      tca:                      evDef.tca,
+      closestApproachDistanceM: evDef.closestApproachDistanceM,
+      relativeSpeedKms:         evDef.relativeSpeedKms,
+      riskLevel:                evDef.riskLevel,
+      status:                   "active",
+      reasoningSteps:           [],
+      agendas:                  [],
+      agendaStatus:             "loading",
+      collisionSummary:         "",
+      errorMsg:                 "",
+      maneuverExecuted:         false,
+    };
 
-  // CSV upload handler
-  const handleUploadCSV = useCallback((e) => {
-    const file = e.target.files?.[0];
-    // Reset so the same file can be re-selected if needed
-    e.target.value = "";
+    setCollisions(prev => [...prev, newCollision]);
+    setSelectedCollisionId(evDef.id);
+    setExpandedCollisionIds(prev => new Set([...prev, evDef.id]));
 
-    if (!file) {
-      setCsvState({ filename: "", error: "No file selected." });
-      return;
-    }
+    generateAgendasForCollision(evDef.id, evDef);
+  }, [generateAgendasForCollision]);
 
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: (results) => {
-        console.log("[q-router] raw CSV rows:", results.data);
+  // ── Demo timer: fire events at deterministic wall-clock offsets ─
+  useEffect(() => {
+    if (!simRunning) return;
 
-        if (!results.data || results.data.length === 0) {
-          setCsvState({ filename: file.name, error: "CSV is empty." });
-          return;
+    const id = setInterval(() => {
+      const elapsed = simElapsedMsRef.current + (Date.now() - (simStartTimeRef.current ?? Date.now()));
+      const secs    = elapsed / 1000;
+
+      for (const ev of DEMO_EVENTS) {
+        if (secs >= ev.triggerSecs && !createdEventsRef.current.has(ev.id)) {
+          createdEventsRef.current.add(ev.id);
+          triggerCollisionEvent(ev);
         }
+      }
+    }, 250);
 
-        // TODO: support batch/event selection when multiple rows are present
-        const row = results.data[0];
+    return () => clearInterval(id);
+  }, [simRunning, triggerCollisionEvent]);
 
-        const validationError = validateCSVRow(row);
-        if (validationError) {
-          setCsvState({ filename: file.name, error: validationError });
-          return;
-        }
-
-        const features = convertCSVRowToFeatures(row);
-        console.log("[q-router] converted features:", features);
-
-        setCsvState({ filename: file.name, error: "" });
-        handleGenerateAgendas(features);
-      },
-      error: (err) => {
-        setCsvState({ filename: file.name, error: `Parse error: ${err.message}` });
-      },
-    });
-  }, [handleGenerateAgendas]);
-
-  const toggleStep = useCallback((i) => {
-    setExpandedSteps((prev) => {
-      const next = new Set(prev);
-      next.has(i) ? next.delete(i) : next.add(i);
-      return next;
-    });
-  }, []);
-
-  const toggleAgenda = useCallback((i) => {
-    setExpandedAgendas((prev) => {
-      const next = new Set(prev);
-      next.has(i) ? next.delete(i) : next.add(i);
-      return next;
-    });
-  }, []);
-
-  // Start / Stop simulation
-  const handleStartStop = useCallback(async () => {
-    const endpoint = simRunning ? "/simulation/stop" : "/simulation/start";
-    try {
-      await fetch(`http://127.0.0.1:8000${endpoint}`, { method: "POST" });
-      setSimRunning((r) => !r);
-    } catch (e) {
-      console.error("[q-router] start/stop error:", e);
+  // ── Start / Stop / Reset simulation ───────────────────────────
+  const handleStartStop = useCallback(() => {
+    if (simRunning) {
+      // Pause: accumulate elapsed
+      if (simStartTimeRef.current !== null) {
+        simElapsedMsRef.current += Date.now() - simStartTimeRef.current;
+        simStartTimeRef.current = null;
+      }
+      setSimRunning(false);
+    } else {
+      // Full reset on every fresh Start
+      simElapsedMsRef.current   = 0;
+      simStartTimeRef.current   = Date.now();
+      createdEventsRef.current  = new Set();
+      setCollisions([]);
+      setSelectedCollisionId(null);
+      setExpandedCollisionIds(new Set());
+      setExpandedAgendasMap({});
+      setExecutedAssets(new Set());
+      setSimResetKey(k => k + 1);
+      setSimRunning(true);
     }
   }, [simRunning]);
 
-  // Execute maneuver from an agenda card
-  const handleExecuteManeuver = useCallback(async (agenda) => {
+  // ── Manual "Generate agendas" button (uses selected or sample) ─
+  const handleGenerateAgendas = useCallback(async (featuresOverride) => {
+    // If a collision is selected, re-run for that collision
+    const selected = collisions.find(c => c.id === selectedCollisionId);
+    if (selected) {
+      setCollisions(prev => prev.map(c => c.id !== selected.id ? c : {
+        ...c, agendaStatus: "loading", reasoningSteps: [], agendas: [], collisionSummary: "", errorMsg: "",
+      }));
+      await generateAgendasForCollision(selected.id, selected);
+      return;
+    }
+
+    // Otherwise create a transient entry from sample / uploaded CSV
+    const fakeId  = `manual-${Date.now()}`;
+    const evDef   = {
+      id: fakeId, primaryAsset: "SAT-01", secondaryObject: "COSMOS 2251 DEB",
+      pc: 0.82, tca: "00:04:22", closestApproachDistanceM: 84, relativeSpeedKms: 14.2, riskLevel: "High",
+    };
+    const features = featuresOverride ?? buildFeaturesForCollision(evDef);
+    const newCol = {
+      ...evDef,
+      status: "active", reasoningSteps: [], agendas: [], agendaStatus: "loading",
+      collisionSummary: "", errorMsg: "", maneuverExecuted: false,
+    };
+    setCollisions(prev => [...prev, newCol]);
+    setSelectedCollisionId(fakeId);
+    setExpandedCollisionIds(prev => new Set([...prev, fakeId]));
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/generate-agendas-from-collision", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ features }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail ?? `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const receivedAgendas = data.agendas ?? [];
+      setCollisions(prev => prev.map(c => c.id !== fakeId ? c : {
+        ...c, agendaStatus: "done", reasoningSteps: data.reasoning_steps ?? [],
+        agendas: receivedAgendas, collisionSummary: buildCollisionSummary(receivedAgendas),
+      }));
+      setExpandedAgendasMap(prev => ({ ...prev, [fakeId]: new Set([0]) }));
+    } catch (e) {
+      setCollisions(prev => prev.map(c => c.id !== fakeId ? c : {
+        ...c, agendaStatus: "error", errorMsg: e.message ?? "Unknown error",
+      }));
+    }
+  }, [collisions, selectedCollisionId, generateAgendasForCollision]);
+
+  // ── Execute maneuver for a collision ──────────────────────────
+  const handleExecuteManeuver = useCallback(async (collisionId, agenda) => {
+    const collision = collisions.find(c => c.id === collisionId);
+    if (!collision) return;
+
     try {
       await fetch("http://127.0.0.1:8000/simulation/execute-maneuver", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          agendaId:      agenda.agenda_id ?? "unknown",
-          primaryAsset:  "SAT-01",
-          secondaryObject: "COSMOS-DEB-01",
-          maneuverType:  "prograde",
+          agendaId:       agenda.agenda_id ?? "unknown",
+          primaryAsset:   collision.primaryAsset,
+          secondaryObject: collision.secondaryObject,
+          maneuverType:   "prograde",
         }),
       });
-      setReasoningSteps((prev) => [
-        ...prev,
+    } catch (_) { /* non-fatal — visual update proceeds regardless */ }
+
+    setCollisions(prev => prev.map(c => c.id !== collisionId ? c : {
+      ...c,
+      status:           "resolved",
+      maneuverExecuted: true,
+      reasoningSteps:   [
+        ...c.reasoningSteps,
         {
           title:  "Avoidance maneuver executed",
-          detail: "SAT-01 trajectory adjusted via prograde burn. Predicted miss distance increased to safe separation. Collision risk resolved. Continuing orbital monitoring for next conjunction window.",
+          detail: `${collision.primaryAsset} trajectory adjusted via prograde burn. Predicted miss distance increased to safe separation. Collision risk resolved.`,
           status: "ok",
         },
-      ]);
-      setRevealedCount((c) => c + 1);
-    } catch (e) {
-      console.error("[q-router] execute-maneuver error:", e);
-    }
+      ],
+    }));
+
+    // Mark asset as executed for OrbitalSimulation visual
+    setExecutedAssets(prev => new Set([...prev, collision.primaryAsset]));
+
+    // Collapse resolved collision, keep it selected
+    setExpandedCollisionIds(prev => {
+      const next = new Set(prev);
+      next.delete(collisionId);
+      return next;
+    });
+  }, [collisions]);
+
+  // ── Toggle collision group ────────────────────────────────────
+  const toggleCollision = useCallback((id) => {
+    setExpandedCollisionIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   }, []);
+
+  // ── Toggle agenda card within a collision ─────────────────────
+  const toggleAgenda = useCallback((collisionId, i) => {
+    setExpandedAgendasMap(prev => {
+      const cur  = prev[collisionId] ?? new Set([0]);
+      const next = new Set(cur);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return { ...prev, [collisionId]: next };
+    });
+  }, []);
+
+  // ── CSV upload ────────────────────────────────────────────────
+  const handleUploadCSV = useCallback((e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) { setCsvState({ filename: "", error: "No file selected." }); return; }
+
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (results) => {
+        if (!results.data || results.data.length === 0) {
+          setCsvState({ filename: file.name, error: "CSV is empty." }); return;
+        }
+        const row = results.data[0];
+        const validationError = validateCSVRow(row);
+        if (validationError) { setCsvState({ filename: file.name, error: validationError }); return; }
+        const features = convertCSVRowToFeatures(row);
+        setCsvState({ filename: file.name, error: "" });
+        handleGenerateAgendas(features);
+      },
+      error: (err) => setCsvState({ filename: file.name, error: `Parse error: ${err.message}` }),
+    });
+  }, [handleGenerateAgendas]);
+
+  // ── Derived state ─────────────────────────────────────────────
+  const selectedCollision  = collisions.find(c => c.id === selectedCollisionId) ?? null;
+  const expandedAgendas    = expandedAgendasMap[selectedCollisionId] ?? new Set([0]);
+  const activeConjunctions = collisions
+    .filter(c => c.status === "active")
+    .map(c => ({ primaryAsset: c.primaryAsset, secondaryObject: c.secondaryObject }));
+
+  const anyActive  = collisions.some(c => c.status === "active");
 
   return (
     <div className="h-screen w-screen bg-neutral-950 text-neutral-100 flex flex-col overflow-hidden">
@@ -1276,12 +1526,16 @@ export default function App() {
             {simRunning ? "Stop Simulation" : "Start Simulation"}
           </button>
           <div className="flex items-center gap-1.5">
-            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${simRunning ? "bg-red-500 animate-pulse" : "bg-neutral-600"}`} />
-            <span className="text-xs text-neutral-400">Conjunction alert</span>
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${anyActive ? "bg-red-500 animate-pulse" : "bg-neutral-600"}`} />
+            <span className="text-xs text-neutral-400">
+              {anyActive ? "Conjunction active" : "Conjunction alert"}
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${simRunning ? "bg-green-500" : "bg-neutral-600"}`} />
-            <span className="text-xs text-neutral-500">{simRunning ? "Simulation live" : "System nominal"}</span>
+            <span className="text-xs text-neutral-500">
+              {simRunning ? "Simulation live" : "System nominal"}
+            </span>
           </div>
         </div>
       </header>
@@ -1290,27 +1544,29 @@ export default function App() {
       <main className="flex-1 flex p-3 min-h-0">
         <LeftPanel
           style={{ width: leftWidth }}
-          status={agendaStatus}
-          reasoningSteps={reasoningSteps}
-          revealedCount={revealedCount}
-          expandedSteps={expandedSteps}
-          onToggleStep={toggleStep}
+          collisions={collisions}
+          selectedCollisionId={selectedCollisionId}
+          expandedCollisionIds={expandedCollisionIds}
+          onSelectCollision={setSelectedCollisionId}
+          onToggleCollision={toggleCollision}
           onGenerate={handleGenerateAgendas}
-          errorMsg={errorMsg}
           csvState={csvState}
-          onUploadCSV={handleUploadCSV}
           csvFileRef={csvFileRef}
-          collisionSummary={collisionSummary}
+          onUploadCSV={handleUploadCSV}
         />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("left", e)} />
-        <OrbitalSim onSimEvent={handleSimEvent} running={simRunning} />
+        <OrbitalSim
+          running={simRunning}
+          resetKey={simResetKey}
+          activeConjunctions={activeConjunctions}
+          executedAssets={executedAssets}
+        />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("right", e)} />
         <RightPanel
           style={{ width: rightWidth }}
-          status={agendaStatus}
-          agendas={agendas}
+          selectedCollision={selectedCollision}
           expandedAgendas={expandedAgendas}
-          onToggleAgenda={toggleAgenda}
+          onToggleAgenda={(i) => toggleAgenda(selectedCollisionId, i)}
           onExecuteAgenda={handleExecuteManeuver}
         />
       </main>
