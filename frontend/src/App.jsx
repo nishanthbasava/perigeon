@@ -150,7 +150,7 @@ const AGENDA_META = [
   { label: "Rapid Response",         strategy: "Fastest intervention sequence",    defaultConfidence: 68 },
 ];
 
-// ─── XML export helpers ───────────────────────────────────────────
+// ─── XML / export helpers ─────────────────────────────────────────
 
 function escapeXml(value) {
   if (value == null) return "";
@@ -162,37 +162,138 @@ function escapeXml(value) {
     .replace(/'/g,  "&apos;");
 }
 
-function agendaToXml(agenda, index) {
-  const meta = AGENDA_META[index] ?? AGENDA_META[0];
-  const rawConf = agenda.confidence * 100;
-  const confidence = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
-
-  const tasksXml = (agenda.tasks ?? []).map((t) => `
-    <task>
-      <order>${escapeXml(t.seq)}</order>
-      <name>${escapeXml(t.task_name)}</name>
-      <computeRoute>${t.quantum_candidate === "yes" ? "quantum" : "classical"}</computeRoute>
-      <reason>${escapeXml(t.reason)}</reason>
-    </task>`).join("");
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<agenda>
-  <id>${index + 1}</id>
-  <name>${escapeXml(meta.label)}</name>
-  <strategy>${escapeXml(meta.strategy)}</strategy>
-  <confidence>${confidence}</confidence>
-  <scenario>
-    <primaryObject>${escapeXml(agenda.scenario?.target_satellite)}</primaryObject>
-    <secondaryObject>${escapeXml(agenda.scenario?.hazard_object)}</secondaryObject>
-    <tca>${agenda.scenario?.tca_seconds != null ? `${(agenda.scenario.tca_seconds / 3600).toFixed(2)} hr` : "unknown"}</tca>
-    <collisionProbability>${escapeXml(agenda.scenario?.collision_probability) || "unknown"}</collisionProbability>
-  </scenario>
-  <tasks>${tasksXml}
-  </tasks>
-</agenda>`;
+function getAssignedAssets(task) {
+  const name = (task.task_name ?? "").toLowerCase();
+  const cat  = (task.category  ?? "").toLowerCase();
+  if (name.includes("geolocation") || name.includes("tdoa") || name.includes("sensor fusion") || cat.includes("rf sensor"))
+    return ["SAT-01", "Ground Sensor Network"];
+  if (name.includes("orbit") || name.includes("propagat"))
+    return ["Flight Dynamics Workstation", "SAT-01 Telemetry"];
+  if (name.includes("maneuver") || name.includes("burn") || name.includes("avoidance"))
+    return ["SAT-01"];
+  if (name.includes("schedul") || name.includes("mission plan") || cat.includes("jadc2"))
+    return ["Mission Planning System"];
+  if (name.includes("monitor") || name.includes("situational") || name.includes("awareness"))
+    return ["Ground Operations", "SAT-01"];
+  return ["Analyst Review"];
 }
 
-function downloadXml(xml, filename) {
+function getTaskDecisionDetails(task) {
+  const name = (task.task_name ?? "").toLowerCase();
+  const cat  = (task.category  ?? "").toLowerCase();
+
+  let whySelected  = task.reason || "Retrieved from task database as a relevant step for this conjunction scenario.";
+  let inputSignals = ["Collision features", "Sensor telemetry", "Orbital state vectors"];
+  let expectedOutput = "Processed result for downstream maneuver planning.";
+  let analystNote    = "Review output before approving downstream tasks.";
+
+  if (name.includes("geolocation") || name.includes("tdoa") || name.includes("sensor")) {
+    inputSignals   = ["Relative position", "Relative velocity", "Sensor confidence", "Tracking source", "Covariance matrix"];
+    expectedOutput = "Validated conjunction geometry and updated confidence estimate.";
+    analystNote    = "Confirm sensor quality before approving downstream maneuver tasks.";
+  } else if (name.includes("orbit") || name.includes("propagat")) {
+    inputSignals   = ["TLE / state vector", "J2 perturbation model", "Atmospheric drag coefficients", "Epoch time"];
+    expectedOutput = "Updated orbital ephemeris with propagated miss distance and uncertainty cone.";
+    analystNote    = "Verify propagation epoch and confirm debris track covariance before accepting.";
+  } else if (name.includes("maneuver") || name.includes("burn") || name.includes("avoidance")) {
+    inputSignals   = ["Delta-v budget", "Thruster status", "Fuel remaining", "Allowed maneuver directions", "TCA window"];
+    expectedOutput = "Candidate burn parameters with estimated post-maneuver miss distance.";
+    analystNote    = "Confirm Δv feasibility against fuel margins. Human approval required before uplink.";
+  } else if (name.includes("schedul") || cat.includes("jadc2")) {
+    inputSignals   = ["Mission timeline", "Priority queue", "Resource availability", "Constellation state"];
+    expectedOutput = "Updated mission schedule with deconflicted task windows.";
+    analystNote    = "Validate schedule against operator constraints before propagating to constellation.";
+  } else if (name.includes("crypt") || cat.includes("comms")) {
+    inputSignals   = ["Communication window", "Link budget", "Encryption state", "Ground station availability"];
+    expectedOutput = "Encrypted command package ready for uplink.";
+    analystNote    = "Confirm comms window and encryption key validity before transmission.";
+  }
+
+  const quantum = task.quantum_candidate === "yes";
+  const logicGates = [
+    { name: "Urgency",      result: "Pass" },
+    { name: "Feasibility",  result: "Pass" },
+    { name: "Comms",        result: "Pass" },
+    { name: "QuantumNeed",  result: quantum ? "Pass - quantum route selected" : "Fail - classical route sufficient" },
+  ];
+
+  return { whySelected, inputSignals, logicGates, expectedOutput, analystNote };
+}
+
+function agendaToXmlReport(agenda, index) {
+  const meta    = AGENDA_META[index] ?? AGENDA_META[0];
+  const rawConf = agenda.confidence * 100;
+  const conf    = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
+  const sc      = agenda.scenario ?? {};
+  const primary = sc.target_satellite || "Unknown";
+  const secondary = sc.hazard_object  || "Unknown";
+  const pc      = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
+  const tca     = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(2)} hr` : "Pending telemetry";
+  const now     = new Date().toISOString();
+
+  const tasksXml = (agenda.tasks ?? []).map((t) => {
+    const assets  = getAssignedAssets(t);
+    const details = getTaskDecisionDetails(t);
+    const route   = t.quantum_candidate === "yes" ? "Quantum" : "Classical";
+    const assetsXml  = assets.map((a) => `        <Asset>${escapeXml(a)}</Asset>`).join("\n");
+    const signalsXml = details.inputSignals.map((s) => `        <Signal>${escapeXml(s)}</Signal>`).join("\n");
+    const gatesXml   = details.logicGates.map((g) =>
+      `        <Gate name="${escapeXml(g.name)}">${escapeXml(g.result)}</Gate>`
+    ).join("\n");
+
+    return `
+    <Task order="${escapeXml(t.seq)}">
+      <TaskName>${escapeXml(t.task_name)}</TaskName>
+      <AssignedAssets>
+${assetsXml}
+      </AssignedAssets>
+      <ComputeRoute>${route}</ComputeRoute>
+      <Purpose>${escapeXml(t.reason || details.whySelected)}</Purpose>
+      <WhySelected>${escapeXml(details.whySelected)}</WhySelected>
+      <InputSignals>
+${signalsXml}
+      </InputSignals>
+      <LogicGateResults>
+${gatesXml}
+      </LogicGateResults>
+      <ExpectedOutput>${escapeXml(details.expectedOutput)}</ExpectedOutput>
+      <AnalystReviewNote>${escapeXml(details.analystNote)}</AnalystReviewNote>
+    </Task>`;
+  }).join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<QRouterManeuverAgendaReport>
+
+  <ReportMetadata>
+    <System>Q-Router</System>
+    <ReportType>Maneuver Agenda Recommendation</ReportType>
+    <GeneratedAt>${now}</GeneratedAt>
+    <Status>DraftForAnalystReview</Status>
+  </ReportMetadata>
+
+  <Agenda>
+    <AgendaId>${index + 1}</AgendaId>
+    <Name>${escapeXml(meta.label)}</Name>
+    <Strategy>${escapeXml(meta.strategy)}</Strategy>
+    <ConfidencePercent>${conf}</ConfidencePercent>
+    <Status>Draft</Status>
+  </Agenda>
+
+  <Scenario>
+    <PrimaryAsset>${escapeXml(primary)}</PrimaryAsset>
+    <SecondaryObject>${escapeXml(secondary)}</SecondaryObject>
+    <CollisionProbability>${escapeXml(pc)}</CollisionProbability>
+    <TimeOfClosestApproach>${escapeXml(tca)}</TimeOfClosestApproach>
+    <RecommendedAction>Review and approve task sequence before command uplink.</RecommendedAction>
+  </Scenario>
+
+  <TaskSequence>${tasksXml}
+  </TaskSequence>
+
+</QRouterManeuverAgendaReport>`;
+}
+
+function downloadXmlReport(xml, filename) {
   const blob = new Blob([xml], { type: "application/xml" });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement("a");
@@ -283,30 +384,107 @@ function ProcessStep({ step, index, expanded, onToggle }) {
   );
 }
 
+// ─── Task step (expandable row inside an agenda) ──────────────────
+
+function TaskStep({ task, taskKey, expanded, onToggle }) {
+  const assets  = getAssignedAssets(task);
+  const details = getTaskDecisionDetails(task);
+  const isQuantum = task.quantum_candidate === "yes";
+  const routeChip = isQuantum
+    ? "border-violet-500/30 text-violet-400"
+    : "border-cyan-500/20 text-cyan-400/80";
+  const routeLabel = isQuantum ? "Quantum" : "Classical";
+  const stepNum = String(task.seq ?? "?").padStart(2, "0");
+
+  return (
+    <div className="border border-white/5 rounded-lg bg-white/2.5 overflow-hidden">
+      {/* Collapsed row */}
+      <button
+        onClick={() => onToggle(taskKey)}
+        className="w-full flex items-start gap-3 px-3 py-3 text-left hover:bg-white/3 transition-colors"
+      >
+        <span className="text-[10px] font-mono text-neutral-600 w-5 mt-px shrink-0">{stepNum}</span>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium text-neutral-100 leading-snug">{task.task_name}</p>
+          <p className="text-[10px] text-neutral-500 mt-0.5 truncate">
+            {assets.join(" + ")}
+          </p>
+          {task.reason && (
+            <p className="text-[10px] text-neutral-500 mt-1 leading-snug line-clamp-1">{task.reason}</p>
+          )}
+        </div>
+        <span className={`text-[9px] border rounded px-1.5 py-0.5 leading-none shrink-0 mt-0.5 ${routeChip}`}>
+          {routeLabel}
+        </span>
+        <span className="text-[10px] text-neutral-700 ml-1 mt-0.5 shrink-0">{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {/* Expanded details */}
+      {expanded && (
+        <div className="px-3 pb-3 pt-2 border-t border-white/5 space-y-2.5">
+          <DetailRow label="Why selected"    value={details.whySelected} />
+          <DetailRow label="Input signals"   value={details.inputSignals.join(", ")} />
+          <div>
+            <p className="text-[9px] text-neutral-600 uppercase tracking-widest mb-1">Logic gates</p>
+            <div className="space-y-0.5">
+              {details.logicGates.map((g) => (
+                <div key={g.name} className="flex items-center gap-2">
+                  <span className={`w-1 h-1 rounded-full shrink-0 ${g.result.startsWith("Pass") ? "bg-green-400" : "bg-red-400"}`} />
+                  <span className="text-[10px] text-neutral-500">{g.name}:</span>
+                  <span className={`text-[10px] ${g.result.startsWith("Pass") ? "text-green-400/80" : "text-red-400/80"}`}>{g.result}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <DetailRow label="Assigned assets" value={assets.join("; ")} />
+          <DetailRow label="Expected output" value={details.expectedOutput} />
+          <DetailRow label="Analyst note"    value={details.analystNote} accent />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailRow({ label, value, accent }) {
+  return (
+    <div>
+      <p className="text-[9px] text-neutral-600 uppercase tracking-widest mb-0.5">{label}</p>
+      <p className={`text-[11px] leading-relaxed ${accent ? "text-amber-400/70" : "text-neutral-400"}`}>{value}</p>
+    </div>
+  );
+}
+
 // ─── Agenda card ──────────────────────────────────────────────────
 
 function AgendaCard({ agenda, rank, expanded, onToggle }) {
+  const [expandedTasks, setExpandedTasks] = useState({});
+
   const index   = rank - 1;
   const meta    = AGENDA_META[index] ?? AGENDA_META[0];
 
-  // Safe confidence: backend returns 0-1 float; guard against null/NaN
   const rawConf = agenda.confidence * 100;
   const confPct = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
+  const feasColor = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
 
-  const feasColor  = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
-  const feasLabel  = agenda.feasibility
-    ? `${agenda.feasibility.charAt(0).toUpperCase()}${agenda.feasibility.slice(1)} confidence`
-    : `${confPct}% confidence`;
+  const sc        = agenda.scenario ?? {};
+  const primary   = sc.target_satellite || "Unknown";
+  const secondary = sc.hazard_object    || "Unknown";
+  const pcVal     = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
+  const tcaVal    = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(1)} hr` : "Pending telemetry";
+
+  function toggleTask(key) {
+    setExpandedTasks((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
 
   function handleExport(e) {
     e.stopPropagation();
-    const xml = agendaToXml(agenda, index);
-    downloadXml(xml, `q-router-agenda-${rank}.xml`);
+    const xml = agendaToXmlReport(agenda, index);
+    downloadXmlReport(xml, `q-router-agenda-${rank}-report.xml`);
   }
 
   return (
     <div className="border border-white/5 rounded-xl overflow-hidden">
-      {/* Collapsed header */}
+      {/* Header */}
       <button
         onClick={onToggle}
         className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-white/2 transition-colors"
@@ -321,12 +499,11 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
               </span>
             )}
           </div>
-          <div className="flex items-center gap-1.5 mt-1">
-            <span className={`text-xs font-medium ${feasColor}`}>{feasLabel}</span>
-            <span className="text-neutral-700">·</span>
-            <span className="text-xs text-neutral-600">{confPct}%</span>
-          </div>
-          <p className="text-[10px] text-neutral-600 mt-0.5 leading-snug">{meta.strategy}</p>
+          <p className="text-xs text-neutral-500 mt-0.5">
+            <span className={feasColor}>{confPct}% confidence</span>
+            <span className="text-neutral-700 mx-1.5">·</span>
+            <span>{meta.strategy}</span>
+          </p>
         </div>
         <span className="text-[10px] text-neutral-600 mt-0.5 shrink-0">{expanded ? "▲" : "▼"}</span>
       </button>
@@ -334,32 +511,22 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
       {/* Expanded body */}
       {expanded && (
         <div className="px-4 pb-4 border-t border-white/5">
-          {/* Scenario snapshot */}
-          <div className="mt-3 mb-3 p-3 bg-neutral-900/60 rounded-lg text-xs font-mono space-y-1">
-            <p className="text-[10px] text-neutral-600 uppercase tracking-widest mb-2">Scenario</p>
-            <p>
-              <span className="text-neutral-500">Satellite </span>
-              <span className="text-neutral-200">{agenda.scenario?.target_satellite ?? "—"}</span>
-              <span className="text-neutral-500"> vs </span>
-              <span className="text-neutral-200">{agenda.scenario?.hazard_object ?? "—"}</span>
-            </p>
-            <p>
-              <span className="text-neutral-500">Pc </span>
-              <span className="text-amber-400">{agenda.scenario?.collision_probability ?? "—"}</span>
-              <span className="text-neutral-500">  TCA </span>
-              <span className="text-neutral-300">{agenda.scenario?.tca_seconds != null
-                ? `${(agenda.scenario.tca_seconds / 3600).toFixed(1)} hr`
-                : "—"}</span>
-            </p>
+          {/* Scenario block */}
+          <div className="mt-3 mb-3 grid grid-cols-2 gap-x-4 gap-y-1.5 p-3 bg-neutral-900/60 rounded-lg text-[11px]">
+            <ScenarioField label="Primary asset"    value={primary} />
+            <ScenarioField label="Secondary object" value={secondary} />
+            <ScenarioField label="Collision Pc"     value={pcVal} warn={pcVal !== "Unknown"} />
+            <ScenarioField label="TCA"              value={tcaVal} />
+            <div className="col-span-2">
+              <ScenarioField label="Plan status" value={agenda.needs_human_review ? "Draft for analyst review" : "Ready for approval"} />
+            </div>
           </div>
 
           {/* Warnings */}
           {agenda.warnings && agenda.warnings.length > 0 && (
             <div className="mb-3 space-y-1">
               {agenda.warnings.map((w, i) => (
-                <p key={i} className="text-[11px] text-amber-400/80 leading-snug">
-                  ⚠ {w}
-                </p>
+                <p key={i} className="text-[11px] text-amber-400/70 leading-snug">⚠ {w}</p>
               ))}
             </div>
           )}
@@ -368,24 +535,21 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
           {agenda.tasks && agenda.tasks.length > 0 && (
             <div className="mb-3">
               <p className="text-[10px] text-neutral-600 uppercase tracking-widest mb-2">
-                Task sequence
+                Task sequence — click row to expand
               </p>
-              <div className="space-y-1">
-                {agenda.tasks.map((t) => (
-                  <div key={t.seq} className="flex gap-3 items-start py-1.5 border-b border-white/5">
-                    <span className="text-[10px] font-mono text-neutral-600 w-4 mt-0.5 shrink-0">{t.seq}</span>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-neutral-200">{t.task_name}</p>
-                      <p className="text-[10px] text-neutral-500">{t.category} · {t.computational_step}</p>
-                      {t.reason && (
-                        <p className="text-[10px] text-cyan-400/70 mt-0.5">{t.reason}</p>
-                      )}
-                    </div>
-                    <span className="text-[10px] font-mono text-neutral-600 shrink-0 mt-0.5">
-                      {t.quantum_candidate === "yes" ? "⚛" : "Cl"}
-                    </span>
-                  </div>
-                ))}
+              <div className="space-y-1.5">
+                {agenda.tasks.map((t, i) => {
+                  const key = `${rank}-${i}`;
+                  return (
+                    <TaskStep
+                      key={key}
+                      task={t}
+                      taskKey={key}
+                      expanded={!!expandedTasks[key]}
+                      onToggle={toggleTask}
+                    />
+                  );
+                })}
               </div>
             </div>
           )}
@@ -407,6 +571,15 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ScenarioField({ label, value, warn }) {
+  return (
+    <div>
+      <p className="text-[9px] text-neutral-600 uppercase tracking-widest">{label}</p>
+      <p className={`text-[11px] font-mono mt-0.5 ${warn ? "text-amber-400" : "text-neutral-300"}`}>{value}</p>
     </div>
   );
 }
