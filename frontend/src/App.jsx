@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 
-// ─── Static data ─────────────────────────────────────────────────
+// ─── Static data ──────────────────────────────────────────────────
 
 const STARS = [
   [45, 28, 0.8], [130, 72, 0.6], [78, 145, 0.7], [195, 45, 0.5],
@@ -15,70 +15,69 @@ const STARS = [
   [878, 422, 0.8], [478, 38, 0.5], [728, 498, 0.6], [562, 555, 0.7],
 ];
 
-const REASONING_STEPS = [
+const SAMPLE_COLLISION = {
+  features: [
+    { feature_group: "llm", feature_name: "risk_class",               value: "HIGH" },
+    { feature_group: "llm", feature_name: "collision_probability",    value: "0.18" },
+    { feature_group: "llm", feature_name: "time_to_closest_approach", value: "15120" },
+    { feature_group: "llm", feature_name: "miss_distance_m",          value: "42" },
+    { feature_group: "llm", feature_name: "target_satellite",         value: "SAT-01" },
+    { feature_group: "llm", feature_name: "hazard_object",            value: "COSMOS-2251-DEB" },
+    { feature_group: "llm", feature_name: "can_maneuver",             value: "yes" },
+    { feature_group: "llm", feature_name: "delta_v_budget",           value: "2.1 m/s" },
+    { feature_group: "llm", feature_name: "fuel_remaining",           value: "38%" },
+    { feature_group: "llm", feature_name: "thruster_status",          value: "nominal" },
+    { feature_group: "llm", feature_name: "allowed_maneuver_types",   value: "prograde, radial" },
+    { feature_group: "llm", feature_name: "power_risk",               value: "low" },
+    { feature_group: "llm", feature_name: "thermal_risk",             value: "low" },
+    { feature_group: "llm", feature_name: "communication_available",  value: "yes" },
+    { feature_group: "llm", feature_name: "communication_risk",       value: "low" },
+    { feature_group: "llm", feature_name: "sensor_confidence",        value: "0.92" },
+    { feature_group: "llm", feature_name: "trust_level",              value: "high" },
+    { feature_group: "llm", feature_name: "safe_autonomous_control",  value: "yes" },
+    { feature_group: "ml",  feature_name: "raw_pc",                   value: "0.18" },
+  ],
+};
+
+const STATIC_STEPS = [
   {
-    id: 1,
-    label: "Conjunction Risk",
-    text: (
-      <>
-        Possible collision path detected between{" "}
-        <span className="font-mono text-neutral-300">SAT-01</span> and{" "}
-        <span className="font-mono text-neutral-300">COSMOS 2251</span> debris.
-      </>
-    ),
+    id: 1, label: "Conjunction Risk", type: "risk",
+    text: <>Possible collision between <span className="font-mono text-neutral-300">SAT-01</span> and <span className="font-mono text-neutral-300">COSMOS 2251</span> debris.</>,
     detail: "Miss distance falls below projected safety threshold.",
-    type: "risk",
   },
   {
-    id: 2,
-    label: "Maneuver Window",
-    text: (
-      <>
-        Evaluating burn timing around{" "}
-        <span className="font-mono text-neutral-300">T+00:04:22</span>.
-      </>
-    ),
-    detail: (
-      <>
-        Prioritizing low-<span className="font-mono">Δv</span> options before
-        escalation.
-      </>
-    ),
-    type: "maneuver",
+    id: 2, label: "Maneuver Window", type: "maneuver",
+    text: <>Evaluating burn timing around <span className="font-mono text-neutral-300">T+00:04:22</span>.</>,
+    detail: <>Prioritizing low-<span className="font-mono">Δv</span> options before escalation.</>,
   },
   {
-    id: 3,
-    label: "Routing Check",
+    id: 3, label: "Routing Check", type: "routing",
     text: "Scoring whether the task should remain classical or route to quantum optimization.",
     detail: "Latency, task size, priority, and uncertainty gates are being evaluated.",
-    type: "routing",
   },
   {
-    id: 4,
-    label: "Next Action",
+    id: 4, label: "Next Action", type: "thinking",
     text: "Awaiting analyst instruction before generating maneuver candidates.",
     detail: "Suggested actions are available below.",
-    type: "thinking",
   },
 ];
 
 const STEP_DOT = {
-  risk: "bg-red-400",
-  maneuver: "bg-amber-400",
-  routing: "bg-cyan-400",
-  thinking: "bg-violet-400",
+  risk: "bg-red-400", maneuver: "bg-amber-400", routing: "bg-cyan-400", thinking: "bg-violet-400",
 };
-
 const STEP_ACCENT = {
-  risk: "bg-red-500/50",
-  maneuver: "bg-amber-500/50",
-  routing: "bg-cyan-500/50",
-  thinking: "bg-violet-500/50",
+  risk: "bg-red-500/50", maneuver: "bg-amber-500/50", routing: "bg-cyan-500/50", thinking: "bg-violet-500/50",
 };
 
-// ─── Left Panel ──────────────────────────────────────────────────
+const FEASIBILITY_COLOR = {
+  high:   "text-green-400",
+  medium: "text-amber-400",
+  low:    "text-red-400",
+};
 
-function ReasoningStep({ step }) {
+// ─── Static reasoning step (idle) ────────────────────────────────
+
+function StaticReasoningStep({ step }) {
   return (
     <div className="flex gap-3">
       <div className={`w-0.5 rounded-full shrink-0 mt-1 mb-0.5 ${STEP_ACCENT[step.type]}`} />
@@ -96,7 +95,179 @@ function ReasoningStep({ step }) {
   );
 }
 
-function LeftPanel({ style }) {
+// ─── Process step (from API reasoning_steps) ──────────────────────
+
+function ProcessStep({ step, index, expanded, onToggle }) {
+  const statusDot =
+    step.status === "ok"      ? "bg-green-400" :
+    step.status === "warn"    ? "bg-amber-400" :
+    step.status === "blocked" ? "bg-red-400"   : "bg-neutral-500";
+
+  return (
+    <div className="border border-white/5 rounded-xl overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-white/2 transition-colors"
+      >
+        <span className="text-[10px] font-mono text-neutral-600 w-4 shrink-0">{index + 1}</span>
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot}`} />
+        <span className="text-sm text-neutral-200 flex-1 leading-snug">{step.title}</span>
+        <span className="text-[10px] text-neutral-600">{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {expanded && (
+        <div className="px-4 pb-3 border-t border-white/5">
+          <p className="text-xs text-neutral-400 leading-relaxed mt-2.5">{step.detail}</p>
+
+          {/* Task list in step showing retrieved tasks (step index 2 = RAG step) */}
+          {step.top_tasks && step.top_tasks.length > 0 && (
+            <div className="mt-3 space-y-1">
+              <p className="text-[10px] text-neutral-600 uppercase tracking-widest mb-2">
+                Top retrieved tasks
+              </p>
+              {step.top_tasks.map((t, i) => (
+                <div key={i} className="flex items-center justify-between py-1.5 border-b border-white/5">
+                  <span className="text-xs text-neutral-300 font-mono">{t.task_id}</span>
+                  <span className="text-xs text-neutral-500 truncate mx-2 flex-1">{t.task_name}</span>
+                  <span className="text-[10px] text-cyan-400 font-mono shrink-0">
+                    {(t.similarity_score * 100).toFixed(0)}%
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Agenda card ──────────────────────────────────────────────────
+
+function AgendaCard({ agenda, rank, expanded, onToggle }) {
+  const feasColor = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
+
+  return (
+    <div className="border border-white/5 rounded-xl overflow-hidden">
+      {/* Collapsed header */}
+      <button
+        onClick={onToggle}
+        className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-white/2 transition-colors"
+      >
+        <span className="text-[10px] font-mono text-neutral-600 w-4 mt-0.5 shrink-0">{rank}</span>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+            <span className="text-sm font-medium text-neutral-100">{agenda.name}</span>
+            {agenda.needs_human_review && (
+              <span className="text-[9px] border border-amber-500/30 text-amber-400/70 px-1.5 py-0.5 rounded-full leading-none">
+                Review required
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3 mt-1">
+            <span className={`text-xs font-medium ${feasColor}`}>
+              {agenda.feasibility} feasibility
+            </span>
+            <span className="text-xs text-neutral-600">
+              {(agenda.confidence * 100).toFixed(0)}% confidence
+            </span>
+          </div>
+          <p className="text-xs text-neutral-500 mt-1 leading-snug line-clamp-2">{agenda.summary}</p>
+        </div>
+        <span className="text-[10px] text-neutral-600 mt-0.5 shrink-0">{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {/* Expanded body */}
+      {expanded && (
+        <div className="px-4 pb-4 border-t border-white/5">
+          {/* Scenario snapshot */}
+          <div className="mt-3 mb-3 p-3 bg-neutral-900/60 rounded-lg text-xs font-mono space-y-1">
+            <p className="text-[10px] text-neutral-600 uppercase tracking-widest mb-2">Scenario</p>
+            <p>
+              <span className="text-neutral-500">Satellite </span>
+              <span className="text-neutral-200">{agenda.scenario?.target_satellite ?? "—"}</span>
+              <span className="text-neutral-500"> vs </span>
+              <span className="text-neutral-200">{agenda.scenario?.hazard_object ?? "—"}</span>
+            </p>
+            <p>
+              <span className="text-neutral-500">Pc </span>
+              <span className="text-amber-400">{agenda.scenario?.collision_probability ?? "—"}</span>
+              <span className="text-neutral-500">  TCA </span>
+              <span className="text-neutral-300">{agenda.scenario?.tca_seconds != null
+                ? `${(agenda.scenario.tca_seconds / 3600).toFixed(1)} hr`
+                : "—"}</span>
+            </p>
+          </div>
+
+          {/* Warnings */}
+          {agenda.warnings && agenda.warnings.length > 0 && (
+            <div className="mb-3 space-y-1">
+              {agenda.warnings.map((w, i) => (
+                <p key={i} className="text-[11px] text-amber-400/80 leading-snug">
+                  ⚠ {w}
+                </p>
+              ))}
+            </div>
+          )}
+
+          {/* Task sequence */}
+          {agenda.tasks && agenda.tasks.length > 0 && (
+            <div className="mb-3">
+              <p className="text-[10px] text-neutral-600 uppercase tracking-widest mb-2">
+                Task sequence
+              </p>
+              <div className="space-y-1">
+                {agenda.tasks.map((t) => (
+                  <div key={t.seq} className="flex gap-3 items-start py-1.5 border-b border-white/5">
+                    <span className="text-[10px] font-mono text-neutral-600 w-4 mt-0.5 shrink-0">{t.seq}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-neutral-200">{t.task_name}</p>
+                      <p className="text-[10px] text-neutral-500">{t.category} · {t.computational_step}</p>
+                      {t.reason && (
+                        <p className="text-[10px] text-cyan-400/70 mt-0.5">{t.reason}</p>
+                      )}
+                    </div>
+                    <span className="text-[10px] font-mono text-neutral-600 shrink-0 mt-0.5">
+                      {t.quantum_candidate === "yes" ? "⚛" : "Cl"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="flex gap-2 mt-3">
+            <button className="flex-1 py-2 text-xs rounded-lg border border-green-500/20 text-green-400/70 hover:border-green-500/40 hover:text-green-300 transition-colors cursor-pointer">
+              Approve
+            </button>
+            <button className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer">
+              Send for review
+            </button>
+            <button className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer">
+              Export
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Left Panel ───────────────────────────────────────────────────
+
+function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg }) {
+  const statusPill =
+    status === "loading" ? "Processing" :
+    status === "done"    ? "Complete"   :
+    status === "error"   ? "Error"      : "Idle";
+
+  const pillColor =
+    status === "loading" ? "border-cyan-500/30 text-cyan-400/80" :
+    status === "done"    ? "border-green-500/30 text-green-400/80" :
+    status === "error"   ? "border-red-500/30 text-red-400/80"   :
+    "border-white/10 text-neutral-500";
+
   return (
     <div
       className="flex flex-col bg-[#171717] rounded-2xl border border-white/5 overflow-hidden shrink-0"
@@ -106,30 +277,84 @@ function LeftPanel({ style }) {
       <div className="px-5 py-4 border-b border-white/5 shrink-0">
         <div className="flex items-center justify-between mb-0.5">
           <h2 className="text-sm font-medium text-neutral-100">Q-Router Copilot</h2>
-          <span className="text-[10px] text-neutral-500 border border-white/10 rounded-full px-2 py-0.5 leading-4">
-            Thinking
+          <span className={`text-[10px] border rounded-full px-2 py-0.5 leading-4 ${pillColor}`}>
+            {statusPill}
           </span>
         </div>
         <p className="text-xs text-neutral-500">Flight dynamics reasoning</p>
       </div>
 
-      {/* Reasoning stream */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5 min-h-0">
-        <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium">
-          Active reasoning
-        </p>
-        {REASONING_STEPS.map((step) => (
-          <ReasoningStep key={step.id} step={step} />
-        ))}
+      {/* Content area */}
+      <div className="flex-1 overflow-y-auto px-5 py-4 min-h-0">
+
+        {/* Idle: static steps */}
+        {status === "idle" && (
+          <>
+            <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-4">
+              Active reasoning
+            </p>
+            <div className="space-y-5">
+              {STATIC_STEPS.map((step) => (
+                <StaticReasoningStep key={step.id} step={step} />
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Loading: spinner */}
+        {status === "loading" && (
+          <div className="flex flex-col items-center justify-center h-full gap-4 py-12">
+            <div className="w-6 h-6 rounded-full border-2 border-cyan-500/30 border-t-cyan-400 animate-spin" />
+            <p className="text-xs text-neutral-500 text-center">Running agenda pipeline…</p>
+          </div>
+        )}
+
+        {/* Done: process steps from API */}
+        {status === "done" && reasoningSteps.length > 0 && (
+          <>
+            <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-3">
+              Reasoning trace
+            </p>
+            <div className="space-y-2">
+              {reasoningSteps.slice(0, revealedCount).map((step, i) => (
+                <ProcessStep
+                  key={i}
+                  step={step}
+                  index={i}
+                  expanded={expandedSteps.has(i)}
+                  onToggle={() => onToggleStep(i)}
+                />
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Error */}
+        {status === "error" && (
+          <div className="py-6">
+            <p className="text-sm text-red-400 mb-1">Request failed</p>
+            <p className="text-xs text-neutral-500 leading-relaxed">{errorMsg}</p>
+            <p className="text-xs text-neutral-600 mt-3">
+              Make sure the backend is running and the vector DB is built.
+            </p>
+          </div>
+        )}
       </div>
 
-      {/* Suggested actions */}
+      {/* Actions */}
       <div className="px-5 pt-2 pb-3 shrink-0">
         <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-2.5">
           Suggested actions
         </p>
-        <div className="flex flex-wrap gap-1.5">
-          {["Analyze risk", "Suggest maneuver", "Explain routing"].map((label) => (
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          <button
+            onClick={onGenerate}
+            disabled={status === "loading"}
+            className="text-xs px-3 py-1 rounded-full border border-cyan-500/30 text-cyan-400/80 hover:border-cyan-500/50 hover:text-cyan-300 transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Generate agendas
+          </button>
+          {["Analyze risk", "Explain routing"].map((label) => (
             <button
               key={label}
               className="text-xs px-3 py-1 rounded-full border border-white/10 text-neutral-400 hover:border-white/20 hover:text-neutral-200 transition-colors duration-150 cursor-pointer"
@@ -161,7 +386,7 @@ function LeftPanel({ style }) {
   );
 }
 
-// ─── Orbital Simulation ──────────────────────────────────────────
+// ─── Orbital Simulation ───────────────────────────────────────────
 
 function OrbitalSim() {
   return (
@@ -197,11 +422,7 @@ function OrbitalSim() {
       </div>
 
       {/* SVG space scene */}
-      <svg
-        viewBox="0 0 900 580"
-        className="w-full h-full"
-        xmlns="http://www.w3.org/2000/svg"
-      >
+      <svg viewBox="0 0 900 580" className="w-full h-full" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <radialGradient id="earthCore" cx="40%" cy="35%" r="65%">
             <stop offset="0%" stopColor="#5DBBDC" />
@@ -222,17 +443,11 @@ function OrbitalSim() {
           </radialGradient>
           <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
             <feGaussianBlur stdDeviation="2.5" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
           </filter>
           <filter id="warnGlow" x="-80%" y="-80%" width="260%" height="260%">
             <feGaussianBlur stdDeviation="4" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
           </filter>
           <radialGradient id="shadowMask" cx="65%" cy="65%" r="55%">
             <stop offset="40%" stopColor="transparent" />
@@ -241,7 +456,6 @@ function OrbitalSim() {
         </defs>
 
         <rect width="900" height="580" fill="#00000A" />
-
         {STARS.map(([x, y, r], i) => (
           <circle key={i} cx={x} cy={y} r={r} fill="white" opacity={0.25 + r * 0.3} />
         ))}
@@ -324,7 +538,7 @@ function OrbitalSim() {
   );
 }
 
-// ─── Right Panel ─────────────────────────────────────────────────
+// ─── Right Panel ──────────────────────────────────────────────────
 
 function ReviewRow({ title }) {
   return (
@@ -338,7 +552,18 @@ function ReviewRow({ title }) {
   );
 }
 
-function RightPanel({ style }) {
+function RightPanel({ style, status, agendas, expandedAgendas, onToggleAgenda }) {
+  const pillLabel =
+    status === "done"    ? `${agendas.length} plans` :
+    status === "loading" ? "Generating…"             :
+    status === "error"   ? "Error"                   : "Awaiting plan";
+
+  const pillColor =
+    status === "done"    ? "border-green-500/30 text-green-400/80" :
+    status === "loading" ? "border-cyan-500/30 text-cyan-400/80"   :
+    status === "error"   ? "border-red-500/30 text-red-400/80"     :
+    "border-white/10 text-neutral-500";
+
   return (
     <div
       className="flex flex-col bg-[#171717] rounded-2xl border border-white/5 overflow-hidden shrink-0"
@@ -348,8 +573,8 @@ function RightPanel({ style }) {
       <div className="px-5 py-4 border-b border-white/5 shrink-0">
         <div className="flex items-center justify-between mb-0.5">
           <h2 className="text-sm font-medium text-neutral-100">Maneuver Plans</h2>
-          <span className="text-[10px] text-neutral-500 border border-white/10 rounded-full px-2 py-0.5 leading-4">
-            Awaiting plan
+          <span className={`text-[10px] border rounded-full px-2 py-0.5 leading-4 ${pillColor}`}>
+            {pillLabel}
           </span>
         </div>
         <p className="text-xs text-neutral-500">Human-in-the-loop review</p>
@@ -357,39 +582,75 @@ function RightPanel({ style }) {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-5 py-5 min-h-0">
-        {/* Empty state */}
-        <p className="text-sm text-neutral-400 leading-relaxed">
-          No maneuver plan generated yet.
-        </p>
-        <p className="text-xs text-neutral-600 mt-1.5 leading-relaxed">
-          Ask the copilot to suggest a candidate burn or routing decision.
-        </p>
 
-        <div className="h-px bg-white/5 mt-5 mb-1" />
+        {/* Idle / loading empty state */}
+        {(status === "idle" || status === "loading") && (
+          <>
+            <p className="text-sm text-neutral-400 leading-relaxed">
+              {status === "loading"
+                ? "Generating maneuver plans…"
+                : "No maneuver plan generated yet."}
+            </p>
+            <p className="text-xs text-neutral-600 mt-1.5 leading-relaxed">
+              {status === "idle"
+                ? "Click \"Generate agendas\" to run the full pipeline."
+                : "Results will appear here when complete."}
+            </p>
+            <div className="h-px bg-white/5 mt-5 mb-1" />
+            <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium py-3">
+              Review sections
+            </p>
+            {["Candidate maneuvers", "Audit trail", "Export package"].map((title) => (
+              <ReviewRow key={title} title={title} />
+            ))}
+          </>
+        )}
 
-        <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium py-3">
-          Review sections
-        </p>
+        {/* Error */}
+        {status === "error" && (
+          <div className="py-4">
+            <p className="text-sm text-red-400">Pipeline failed</p>
+            <p className="text-xs text-neutral-600 mt-1.5">
+              Check the left panel for details.
+            </p>
+          </div>
+        )}
 
-        {["Candidate maneuvers", "Audit trail", "Export package"].map((title) => (
-          <ReviewRow key={title} title={title} />
-        ))}
+        {/* Agendas */}
+        {status === "done" && agendas.length > 0 && (
+          <div className="space-y-3">
+            <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-1">
+              Ranked agenda options
+            </p>
+            {agendas.map((agenda, i) => (
+              <AgendaCard
+                key={agenda.agenda_id ?? i}
+                agenda={agenda}
+                rank={i + 1}
+                expanded={expandedAgendas.has(i)}
+                onToggle={() => onToggleAgenda(i)}
+              />
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Action buttons */}
-      <div className="px-5 pb-5 pt-3 space-y-2 shrink-0">
-        <button className="w-full py-2 rounded-xl border border-amber-500/20 text-amber-400/60 text-sm hover:border-amber-500/35 hover:text-amber-300 transition-colors duration-150 cursor-pointer">
-          Approve plan
-        </button>
-        <div className="flex gap-2">
-          <button className="flex-1 py-2 rounded-xl border border-white/8 text-neutral-500 text-sm hover:border-white/15 hover:text-neutral-300 transition-colors duration-150 cursor-pointer">
-            Export
+      {status !== "done" && (
+        <div className="px-5 pb-5 pt-3 space-y-2 shrink-0">
+          <button className="w-full py-2 rounded-xl border border-amber-500/20 text-amber-400/60 text-sm hover:border-amber-500/35 hover:text-amber-300 transition-colors duration-150 cursor-pointer">
+            Approve plan
           </button>
-          <button className="flex-1 py-2 rounded-xl border border-white/8 text-neutral-500 text-sm hover:border-white/15 hover:text-neutral-300 transition-colors duration-150 cursor-pointer">
-            View audit
-          </button>
+          <div className="flex gap-2">
+            <button className="flex-1 py-2 rounded-xl border border-white/8 text-neutral-500 text-sm hover:border-white/15 hover:text-neutral-300 transition-colors duration-150 cursor-pointer">
+              Export
+            </button>
+            <button className="flex-1 py-2 rounded-xl border border-white/8 text-neutral-500 text-sm hover:border-white/15 hover:text-neutral-300 transition-colors duration-150 cursor-pointer">
+              View audit
+            </button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -413,19 +674,29 @@ function DragDivider({ onMouseDown }) {
 const LEFT_MIN = 240;
 const LEFT_MAX = 500;
 const RIGHT_MIN = 260;
-const RIGHT_MAX = 520;
+const RIGHT_MAX = 540;
 
 export default function App() {
-  const [leftWidth, setLeftWidth] = useState(320);
-  const [rightWidth, setRightWidth] = useState(320);
+  const [leftWidth, setLeftWidth]   = useState(340);
+  const [rightWidth, setRightWidth] = useState(360);
 
-  const dragging = useRef(null);
-  const startX = useRef(0);
+  // Agenda pipeline state
+  const [agendaStatus, setAgendaStatus]     = useState("idle");   // idle | loading | done | error
+  const [reasoningSteps, setReasoningSteps] = useState([]);
+  const [agendas, setAgendas]               = useState([]);
+  const [errorMsg, setErrorMsg]             = useState("");
+  const [revealedCount, setRevealedCount]   = useState(0);
+  const [expandedSteps, setExpandedSteps]   = useState(new Set());
+  const [expandedAgendas, setExpandedAgendas] = useState(new Set([0])); // first expanded by default
+
+  // Panel resize
+  const dragging   = useRef(null);
+  const startX     = useRef(0);
   const startWidth = useRef(0);
 
   const handleDividerMouseDown = (side, e) => {
-    dragging.current = side;
-    startX.current = e.clientX;
+    dragging.current  = side;
+    startX.current    = e.clientX;
     startWidth.current = side === "left" ? leftWidth : rightWidth;
     document.body.style.userSelect = "none";
     e.preventDefault();
@@ -451,6 +722,60 @@ export default function App() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
+  }, []);
+
+  // Reveal reasoning steps one-by-one after data loads
+  useEffect(() => {
+    if (agendaStatus !== "done" || reasoningSteps.length === 0) return;
+    if (revealedCount >= reasoningSteps.length) return;
+    const t = setTimeout(() => setRevealedCount((c) => c + 1), 200);
+    return () => clearTimeout(t);
+  }, [agendaStatus, reasoningSteps, revealedCount]);
+
+  // Generate agendas
+  const handleGenerateAgendas = useCallback(async () => {
+    setAgendaStatus("loading");
+    setReasoningSteps([]);
+    setAgendas([]);
+    setErrorMsg("");
+    setRevealedCount(0);
+    setExpandedSteps(new Set());
+    setExpandedAgendas(new Set([0]));
+
+    try {
+      const res = await fetch("http://localhost:5001/generate-agendas-from-collision", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(SAMPLE_COLLISION),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail ?? `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setReasoningSteps(data.reasoning_steps ?? []);
+      setAgendas(data.agendas ?? []);
+      setAgendaStatus("done");
+    } catch (e) {
+      setErrorMsg(e.message ?? "Unknown error");
+      setAgendaStatus("error");
+    }
+  }, []);
+
+  const toggleStep = useCallback((i) => {
+    setExpandedSteps((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+  }, []);
+
+  const toggleAgenda = useCallback((i) => {
+    setExpandedAgendas((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
   }, []);
 
   return (
@@ -480,11 +805,26 @@ export default function App() {
 
       {/* Three-column layout */}
       <main className="flex-1 flex p-3 min-h-0">
-        <LeftPanel style={{ width: leftWidth }} />
+        <LeftPanel
+          style={{ width: leftWidth }}
+          status={agendaStatus}
+          reasoningSteps={reasoningSteps}
+          revealedCount={revealedCount}
+          expandedSteps={expandedSteps}
+          onToggleStep={toggleStep}
+          onGenerate={handleGenerateAgendas}
+          errorMsg={errorMsg}
+        />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("left", e)} />
         <OrbitalSim />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("right", e)} />
-        <RightPanel style={{ width: rightWidth }} />
+        <RightPanel
+          style={{ width: rightWidth }}
+          status={agendaStatus}
+          agendas={agendas}
+          expandedAgendas={expandedAgendas}
+          onToggleAgenda={toggleAgenda}
+        />
       </main>
     </div>
   );

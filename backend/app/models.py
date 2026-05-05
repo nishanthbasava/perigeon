@@ -47,3 +47,7 @@ class RetrieveTasksResponse(BaseModel):
 class RetrieveFromCollisionResponse(BaseModel):
     generated_query: str
     results:         list[RetrievedTask]
+
+
+class GenerateAgendasRequest(BaseModel):
+    features: list[dict]

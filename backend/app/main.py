@@ -7,11 +7,13 @@ from app.models import (
     RetrieveFromCollisionRequest,
     RetrieveFromCollisionResponse,
     RetrievedTask,
+    GenerateAgendasRequest,
 )
 from vector_db.task_retriever import (
     retrieve_relevant_tasks,
     build_collision_rag_query,
 )
+from app.agenda_maker import generate_agendas_from_collision
 
 app = FastAPI(title="Q-Router API")
 
@@ -67,6 +69,19 @@ def retrieve_tasks(req: RetrieveTasksRequest):
             for r in raw
         ],
     )
+
+
+@app.post("/generate-agendas-from-collision")
+def generate_agendas(req: GenerateAgendasRequest):
+    """
+    Full pipeline: collision features → RAG retrieval → deterministic scoring →
+    3 ranked agenda options with reasoning steps.
+    """
+    try:
+        result = generate_agendas_from_collision({"features": req.features})
+        return result
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/retrieve-tasks-from-collision", response_model=RetrieveFromCollisionResponse)
