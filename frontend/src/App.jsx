@@ -150,6 +150,25 @@ const AGENDA_META = [
   { label: "Rapid Response",         strategy: "Fastest intervention sequence",    defaultConfidence: 68 },
 ];
 
+// Shared demo scenario — single source of truth for UI display and HTML export.
+// Values are used as fallbacks when the backend scenario fields are absent/null.
+const DEMO_SCENARIO = {
+  primaryAsset:      "SAT-01",
+  secondaryObject:   "COSMOS 2251 DEB",
+  collisionPc:       "0.82",
+  tca:               "2026-05-05 06:44:15 UTC",
+  timeToTca:         "00:04:22",
+  orbitRegime:       "LEO",
+  closestApproachM:  "84 m",
+  relativeSpeedKms:  "14.2 km/s",
+  riskLevel:         "High",
+};
+
+// Zero-padded step number from 0-based array index
+function getStepNumber(index) {
+  return String(index + 1).padStart(2, "0");
+}
+
 // ─── Export helpers ───────────────────────────────────────────────
 
 function getAssignedAssets(task) {
@@ -157,11 +176,15 @@ function getAssignedAssets(task) {
   const cat  = (task.category  ?? "").toLowerCase();
   if (name.includes("geolocation") || name.includes("tdoa") || name.includes("sensor fusion") || cat.includes("rf sensor"))
     return ["SAT-01", "Ground Sensor Network"];
-  if (name.includes("orbit") || name.includes("propagat"))
+  if (name.includes("orbit") || name.includes("propagat") || name.includes("sgp4"))
     return ["Flight Dynamics Workstation", "SAT-01 Telemetry"];
   if (name.includes("maneuver") || name.includes("burn") || name.includes("avoidance"))
     return ["SAT-01"];
-  if (name.includes("schedul") || name.includes("mission plan") || cat.includes("jadc2"))
+  if (name.includes("vrp") || name.includes("multi-vehicle") || name.includes("routing"))
+    return ["Mission Planning System", "SAT-01"];
+  if (name.includes("weapon") || name.includes("target assignment") || name.includes("wta"))
+    return ["Ground Operations", "Tracking Network"];
+  if (name.includes("schedul") || name.includes("tasking") || name.includes("mission plan") || cat.includes("jadc2"))
     return ["Mission Planning System"];
   if (name.includes("monitor") || name.includes("situational") || name.includes("awareness"))
     return ["Ground Operations", "SAT-01"];
@@ -223,18 +246,20 @@ function agendaToHtmlReport(agenda, index) {
   const meta    = AGENDA_META[index] ?? AGENDA_META[0];
   const rawConf = agenda.confidence * 100;
   const conf    = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
-  const sc      = agenda.scenario ?? {};
-  const primary   = sc.target_satellite || "Unknown";
-  const secondary = sc.hazard_object    || "Unknown";
-  const pc        = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
-  const tca       = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(2)} hr` : "Pending telemetry";
+  const sc        = agenda.scenario ?? {};
+  const primary   = sc.target_satellite || DEMO_SCENARIO.primaryAsset;
+  const secondary = sc.hazard_object    || DEMO_SCENARIO.secondaryObject;
+  const pc        = sc.collision_probability != null ? String(sc.collision_probability) : DEMO_SCENARIO.collisionPc;
+  const tca       = sc.tca_seconds != null
+    ? `${(sc.tca_seconds / 3600).toFixed(2)} hr`
+    : DEMO_SCENARIO.tca;
   const now       = new Date().toLocaleString("en-US", { timeZoneName: "short" });
 
-  const taskRows = (agenda.tasks ?? []).map((t) => {
+  const taskRows = (agenda.tasks ?? []).map((t, i) => {
     const assets  = getAssignedAssets(t);
     const details = getTaskDecisionDetails(t);
     const route   = t.quantum_candidate === "yes" ? "Quantum" : "Classical";
-    const stepNum = String(t.seq ?? "?").padStart(2, "0");
+    const stepNum = getStepNumber(i);
     return `
       <tr>
         <td>${escapeHtml(stepNum)}</td>
@@ -304,7 +329,12 @@ function agendaToHtmlReport(agenda, index) {
     <div class="label">Primary Asset</div><div>${escapeHtml(primary)}</div>
     <div class="label">Secondary Object</div><div>${escapeHtml(secondary)}</div>
     <div class="label">Collision Probability</div><div>${escapeHtml(pc)}</div>
-    <div class="label">Time to Closest Approach</div><div>${escapeHtml(tca)}</div>
+    <div class="label">TCA (UTC)</div><div>${escapeHtml(tca)}</div>
+    <div class="label">Time to TCA</div><div>${escapeHtml(DEMO_SCENARIO.timeToTca)}</div>
+    <div class="label">Orbit Regime</div><div>${escapeHtml(DEMO_SCENARIO.orbitRegime)}</div>
+    <div class="label">Closest Approach Distance</div><div>${escapeHtml(DEMO_SCENARIO.closestApproachM)}</div>
+    <div class="label">Relative Speed</div><div>${escapeHtml(DEMO_SCENARIO.relativeSpeedKms)}</div>
+    <div class="label">Risk Level</div><div>${escapeHtml(DEMO_SCENARIO.riskLevel)}</div>
     <div class="label">Recommended Action</div><div>Review and approve task sequence before command uplink.</div>
   </div>
   ${warningsHtml}
@@ -443,7 +473,7 @@ function ProcessStep({ step, index, expanded, onToggle }) {
 
 // ─── Task step (expandable row inside an agenda) ──────────────────
 
-function TaskStep({ task, taskKey, expanded, onToggle }) {
+function TaskStep({ task, taskKey, taskIndex, expanded, onToggle }) {
   const assets  = getAssignedAssets(task);
   const details = getTaskDecisionDetails(task);
   const isQuantum = task.quantum_candidate === "yes";
@@ -451,7 +481,8 @@ function TaskStep({ task, taskKey, expanded, onToggle }) {
     ? "border-violet-500/30 text-violet-400"
     : "border-cyan-500/20 text-cyan-400/80";
   const routeLabel = isQuantum ? "Quantum" : "Classical";
-  const stepNum = String(task.seq ?? "?").padStart(2, "0");
+  // Use index-based step number — never shows "0?" even when task.seq is null
+  const stepNum = getStepNumber(taskIndex);
 
   return (
     <div className="border border-white/5 rounded-lg bg-white/2.5 overflow-hidden">
@@ -525,10 +556,12 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
   const feasColor = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
 
   const sc        = agenda.scenario ?? {};
-  const primary   = sc.target_satellite || "Unknown";
-  const secondary = sc.hazard_object    || "Unknown";
-  const pcVal     = sc.collision_probability != null ? String(sc.collision_probability) : "Unknown";
-  const tcaVal    = sc.tca_seconds != null ? `${(sc.tca_seconds / 3600).toFixed(1)} hr` : "Pending telemetry";
+  const primary   = sc.target_satellite || DEMO_SCENARIO.primaryAsset;
+  const secondary = sc.hazard_object    || DEMO_SCENARIO.secondaryObject;
+  const pcVal     = sc.collision_probability != null ? String(sc.collision_probability) : DEMO_SCENARIO.collisionPc;
+  const tcaVal    = sc.tca_seconds != null
+    ? `${(sc.tca_seconds / 3600).toFixed(1)} hr`
+    : DEMO_SCENARIO.tca;
 
   // Green border for recommended (rank 1), default for others
   const cardBorder = isRecommended ? "border-green-500/30" : "border-white/5";
@@ -614,6 +647,7 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
                       key={key}
                       task={t}
                       taskKey={key}
+                      taskIndex={i}
                       expanded={!!expandedTasks[key]}
                       onToggle={toggleTask}
                     />
