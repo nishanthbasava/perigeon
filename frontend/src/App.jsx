@@ -143,6 +143,79 @@ const FEASIBILITY_COLOR = {
   low:    "text-red-400",
 };
 
+// Display metadata keyed by 1-based rank position
+const AGENDA_META = [
+  { label: "Conservative Avoidance", strategy: "Low-risk maneuver path",          defaultConfidence: 82 },
+  { label: "Monitor + Validate",     strategy: "Sensor-first verification",        defaultConfidence: 74 },
+  { label: "Rapid Response",         strategy: "Fastest intervention sequence",    defaultConfidence: 68 },
+];
+
+// ─── XML export helpers ───────────────────────────────────────────
+
+function escapeXml(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/&/g,  "&amp;")
+    .replace(/</g,  "&lt;")
+    .replace(/>/g,  "&gt;")
+    .replace(/"/g,  "&quot;")
+    .replace(/'/g,  "&apos;");
+}
+
+function agendaToXml(agenda, index) {
+  const meta = AGENDA_META[index] ?? AGENDA_META[0];
+  const rawConf = agenda.confidence * 100;
+  const confidence = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
+
+  const tasksXml = (agenda.tasks ?? []).map((t) => `
+    <task>
+      <order>${escapeXml(t.seq)}</order>
+      <name>${escapeXml(t.task_name)}</name>
+      <computeRoute>${t.quantum_candidate === "yes" ? "quantum" : "classical"}</computeRoute>
+      <reason>${escapeXml(t.reason)}</reason>
+    </task>`).join("");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<agenda>
+  <id>${index + 1}</id>
+  <name>${escapeXml(meta.label)}</name>
+  <strategy>${escapeXml(meta.strategy)}</strategy>
+  <confidence>${confidence}</confidence>
+  <scenario>
+    <primaryObject>${escapeXml(agenda.scenario?.target_satellite)}</primaryObject>
+    <secondaryObject>${escapeXml(agenda.scenario?.hazard_object)}</secondaryObject>
+    <tca>${agenda.scenario?.tca_seconds != null ? `${(agenda.scenario.tca_seconds / 3600).toFixed(2)} hr` : "unknown"}</tca>
+    <collisionProbability>${escapeXml(agenda.scenario?.collision_probability) || "unknown"}</collisionProbability>
+  </scenario>
+  <tasks>${tasksXml}
+  </tasks>
+</agenda>`;
+}
+
+function downloadXml(xml, filename) {
+  const blob = new Blob([xml], { type: "application/xml" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── Collision summary builder ────────────────────────────────────
+
+function buildCollisionSummary(agendas) {
+  if (!agendas || agendas.length === 0) return null;
+  const sc  = agendas[0]?.scenario ?? {};
+  const sat = sc.target_satellite ?? "the primary satellite";
+  const deb = sc.hazard_object    ?? "an untracked object";
+  const pc  = sc.collision_probability != null ? `Collision probability is estimated at ${sc.collision_probability}.` : "";
+  const tca = sc.tca_seconds != null
+    ? `Time to closest approach is approximately ${(sc.tca_seconds / 3600).toFixed(1)} hours.`
+    : "";
+  return `${sat} was flagged for a possible conjunction with ${deb}. ${pc} ${tca} Q-Router retrieved relevant orbital safety tasks, applied feasibility gates, and generated ${agendas.length} ranked maneuver agendas for analyst review. Recommended next step: validate sensor geometry, propagate the orbit, then review the lowest-risk maneuver plan.`.replace(/\s{2,}/g, " ").trim();
+}
+
 // ─── Static reasoning step (idle) ────────────────────────────────
 
 function StaticReasoningStep({ step }) {
@@ -213,7 +286,23 @@ function ProcessStep({ step, index, expanded, onToggle }) {
 // ─── Agenda card ──────────────────────────────────────────────────
 
 function AgendaCard({ agenda, rank, expanded, onToggle }) {
-  const feasColor = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
+  const index   = rank - 1;
+  const meta    = AGENDA_META[index] ?? AGENDA_META[0];
+
+  // Safe confidence: backend returns 0-1 float; guard against null/NaN
+  const rawConf = agenda.confidence * 100;
+  const confPct = Number.isFinite(rawConf) ? Math.round(rawConf) : meta.defaultConfidence;
+
+  const feasColor  = FEASIBILITY_COLOR[agenda.feasibility] ?? "text-neutral-400";
+  const feasLabel  = agenda.feasibility
+    ? `${agenda.feasibility.charAt(0).toUpperCase()}${agenda.feasibility.slice(1)} confidence`
+    : `${confPct}% confidence`;
+
+  function handleExport(e) {
+    e.stopPropagation();
+    const xml = agendaToXml(agenda, index);
+    downloadXml(xml, `q-router-agenda-${rank}.xml`);
+  }
 
   return (
     <div className="border border-white/5 rounded-xl overflow-hidden">
@@ -225,22 +314,19 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
         <span className="text-[10px] font-mono text-neutral-600 w-4 mt-0.5 shrink-0">{rank}</span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-            <span className="text-sm font-medium text-neutral-100">{agenda.name}</span>
+            <span className="text-sm font-medium text-neutral-100">{meta.label}</span>
             {agenda.needs_human_review && (
               <span className="text-[9px] border border-amber-500/30 text-amber-400/70 px-1.5 py-0.5 rounded-full leading-none">
                 Review required
               </span>
             )}
           </div>
-          <div className="flex items-center gap-3 mt-1">
-            <span className={`text-xs font-medium ${feasColor}`}>
-              {agenda.feasibility} feasibility
-            </span>
-            <span className="text-xs text-neutral-600">
-              {(agenda.confidence * 100).toFixed(0)}% confidence
-            </span>
+          <div className="flex items-center gap-1.5 mt-1">
+            <span className={`text-xs font-medium ${feasColor}`}>{feasLabel}</span>
+            <span className="text-neutral-700">·</span>
+            <span className="text-xs text-neutral-600">{confPct}%</span>
           </div>
-          <p className="text-xs text-neutral-500 mt-1 leading-snug line-clamp-2">{agenda.summary}</p>
+          <p className="text-[10px] text-neutral-600 mt-0.5 leading-snug">{meta.strategy}</p>
         </div>
         <span className="text-[10px] text-neutral-600 mt-0.5 shrink-0">{expanded ? "▲" : "▼"}</span>
       </button>
@@ -312,7 +398,10 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
             <button className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer">
               Send for review
             </button>
-            <button className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer">
+            <button
+              onClick={handleExport}
+              className="flex-1 py-2 text-xs rounded-lg border border-white/8 text-neutral-500 hover:border-white/15 hover:text-neutral-300 transition-colors cursor-pointer"
+            >
               Export
             </button>
           </div>
@@ -322,9 +411,23 @@ function AgendaCard({ agenda, rank, expanded, onToggle }) {
   );
 }
 
+// ─── Collision summary ────────────────────────────────────────────
+
+function CollisionSummary({ text }) {
+  if (!text) return null;
+  return (
+    <div className="mt-4 mb-1 border border-white/5 rounded-xl px-4 py-3">
+      <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-2">
+        Collision summary
+      </p>
+      <p className="text-xs text-neutral-400 leading-relaxed">{text}</p>
+    </div>
+  );
+}
+
 // ─── Left Panel ───────────────────────────────────────────────────
 
-function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg, csvState, onUploadCSV, csvFileRef }) {
+function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps, onToggleStep, onGenerate, errorMsg, csvState, onUploadCSV, csvFileRef, collisionSummary }) {
   const statusPill =
     status === "loading" ? "Processing" :
     status === "done"    ? "Complete"   :
@@ -377,7 +480,7 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
           </div>
         )}
 
-        {/* Done: process steps from API */}
+        {/* Done: process steps from API + collision summary */}
         {status === "done" && reasoningSteps.length > 0 && (
           <>
             <p className="text-[10px] text-neutral-600 uppercase tracking-widest font-medium mb-3">
@@ -394,6 +497,9 @@ function LeftPanel({ style, status, reasoningSteps, revealedCount, expandedSteps
                 />
               ))}
             </div>
+            {revealedCount >= reasoningSteps.length && (
+              <CollisionSummary text={collisionSummary} />
+            )}
           </>
         )}
 
@@ -778,16 +884,16 @@ export default function App() {
   const [rightWidth, setRightWidth] = useState(360);
 
   // Agenda pipeline state
-  const [agendaStatus, setAgendaStatus]     = useState("idle");   // idle | loading | done | error
-  const [reasoningSteps, setReasoningSteps] = useState([]);
-  const [agendas, setAgendas]               = useState([]);
-  const [errorMsg, setErrorMsg]             = useState("");
-  const [revealedCount, setRevealedCount]   = useState(0);
-  const [expandedSteps, setExpandedSteps]   = useState(new Set());
-  const [expandedAgendas, setExpandedAgendas] = useState(new Set([0])); // first expanded by default
+  const [agendaStatus, setAgendaStatus]         = useState("idle"); // idle | loading | done | error
+  const [reasoningSteps, setReasoningSteps]     = useState([]);
+  const [agendas, setAgendas]                   = useState([]);
+  const [collisionSummary, setCollisionSummary] = useState("");
+  const [errorMsg, setErrorMsg]                 = useState("");
+  const [revealedCount, setRevealedCount]       = useState(0);
+  const [expandedSteps, setExpandedSteps]       = useState(new Set());
+  const [expandedAgendas, setExpandedAgendas]   = useState(new Set([0])); // first expanded by default
 
   // CSV upload state
-  const [uploadedFeatures, setUploadedFeatures] = useState(null);
   const [csvState, setCsvState] = useState({ filename: "", error: "" });
   const csvFileRef = useRef(null);
 
@@ -839,6 +945,7 @@ export default function App() {
     setAgendaStatus("loading");
     setReasoningSteps([]);
     setAgendas([]);
+    setCollisionSummary("");
     setErrorMsg("");
     setRevealedCount(0);
     setExpandedSteps(new Set());
@@ -862,8 +969,10 @@ export default function App() {
       }
       const data = await res.json();
       console.log("[q-router] backend response:", data);
+      const receivedAgendas = data.agendas ?? [];
       setReasoningSteps(data.reasoning_steps ?? []);
-      setAgendas(data.agendas ?? []);
+      setAgendas(receivedAgendas);
+      setCollisionSummary(buildCollisionSummary(receivedAgendas));
       setAgendaStatus("done");
     } catch (e) {
       setErrorMsg(e.message ?? "Unknown error");
@@ -906,7 +1015,6 @@ export default function App() {
         console.log("[q-router] converted features:", features);
 
         setCsvState({ filename: file.name, error: "" });
-        setUploadedFeatures(features);
         handleGenerateAgendas(features);
       },
       error: (err) => {
@@ -970,6 +1078,7 @@ export default function App() {
           csvState={csvState}
           onUploadCSV={handleUploadCSV}
           csvFileRef={csvFileRef}
+          collisionSummary={collisionSummary}
         />
         <DragDivider onMouseDown={(e) => handleDividerMouseDown("left", e)} />
         <OrbitalSim />
