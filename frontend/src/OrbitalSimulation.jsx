@@ -6,14 +6,129 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 // 0.12 = ~8x slower than original; one orbit takes ~3 minutes wall clock
 const SIM_SPEED = 0.12;
 
+// ─── Collision prediction ─────────────────────────────────────────
+// Distance below which a future close approach triggers a conjunction alert.
+// 1 scene unit ≈ 6,371 km (1 Earth radius).
+// 0.04 scene units ≈ 255 km — realistic LEO conjunction warning margin.
+// Slightly generous threshold so real close approaches are caught early.
+// Explicit pair list prevents cross-pair false positives entirely.
+const DEMO_COLLISION_THRESHOLD = 0.055;
+const COLLISION_LOOKAHEAD_SECS = 260; // sim-seconds to scan ahead each check (must exceed relative orbital period ~209s)
+const COLLISION_SAMPLE_STEP    = 0.5; // sim-seconds between lookahead samples
+
+// Only these pairs are checked — avoids any cross-pair false positives
+const COLLISION_PAIRS = [
+  { satId: "SAT-01", debrisId: "COSMOS 2251 DEB" },
+  { satId: "SAT-03", debrisId: "IRIDIUM 33 DEB"  },
+];
+
+// ─── Seeded PRNG (mulberry32) ─────────────────────────────────────
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Generate per-object phi0 starting angles from a seed.
+// Collision pair debris phi0 values are derived from their partner satellite's
+// random phi0 so the close-approach timing is preserved regardless of seed.
+function generatePhi0s(seed) {
+  const rand = mulberry32(seed >>> 0);
+  const TAU  = Math.PI * 2;
+
+  const phi_sat01 = rand() * TAU;
+  const phi_sat03 = rand() * TAU;
+
+  return {
+    "SAT-01":          phi_sat01,
+    "SAT-03":          phi_sat03,
+    "SAT-02":          rand() * TAU,
+    "SAT-04":          rand() * TAU,
+    "SAT-05":          rand() * TAU,
+    // COSMOS converges with SAT-01 at t≈100s.
+    // delta_ω = (0.30-0.55)*SIM_SPEED = -0.030 → separation at t=0 is ~3.0 rad (≈opposite side)
+    "COSMOS 2251 DEB": phi_sat01 + (0.30 - 0.55) * SIM_SPEED * 100,
+    // IRIDIUM converges with SAT-03 at t≈150s.
+    // delta_ω = (0.27-0.50)*SIM_SPEED = -0.0276 → separation at t=0 is ~4.14 rad (≈120° apart)
+    "IRIDIUM 33 DEB":  phi_sat03 + (0.27 - 0.50) * SIM_SPEED * 150,
+  };
+}
+
+// ─── Earth texture (procedural canvas) ───────────────────────────
+function createEarthTexture() {
+  const W = 2048, H = 1024;
+  const cv  = document.createElement("canvas");
+  cv.width  = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+
+  // Ocean
+  ctx.fillStyle = "#0a2240"; ctx.fillRect(0, 0, W, H);
+  const og = ctx.createLinearGradient(0, H * 0.3, 0, H * 0.7);
+  og.addColorStop(0, "rgba(22,82,148,0)"); og.addColorStop(0.5, "rgba(22,82,148,0.22)"); og.addColorStop(1, "rgba(22,82,148,0)");
+  ctx.fillStyle = og; ctx.fillRect(0, 0, W, H);
+
+  const fill = (color, fn) => { ctx.fillStyle = color; ctx.beginPath(); fn(); ctx.fill(); };
+
+  // North America
+  fill("#2e5a1a", () => { ctx.moveTo(W*.12,H*.22); ctx.bezierCurveTo(W*.20,H*.14,W*.30,H*.18,W*.30,H*.32); ctx.bezierCurveTo(W*.30,H*.44,W*.22,H*.52,W*.17,H*.52); ctx.bezierCurveTo(W*.11,H*.46,W*.10,H*.34,W*.12,H*.22); ctx.closePath(); });
+  // Central America
+  fill("#336622", () => { ctx.moveTo(W*.17,H*.52); ctx.bezierCurveTo(W*.20,H*.52,W*.22,H*.57,W*.21,H*.60); ctx.bezierCurveTo(W*.18,H*.59,W*.16,H*.56,W*.17,H*.52); ctx.closePath(); });
+  // South America
+  fill("#2a5a16", () => { ctx.moveTo(W*.22,H*.57); ctx.bezierCurveTo(W*.30,H*.54,W*.34,H*.62,W*.32,H*.74); ctx.bezierCurveTo(W*.28,H*.84,W*.20,H*.82,W*.17,H*.74); ctx.bezierCurveTo(W*.15,H*.65,W*.17,H*.57,W*.22,H*.57); ctx.closePath(); });
+  // Europe
+  fill("#3a6820", () => { ctx.moveTo(W*.47,H*.22); ctx.bezierCurveTo(W*.52,H*.16,W*.58,H*.18,W*.58,H*.28); ctx.bezierCurveTo(W*.56,H*.36,W*.50,H*.38,W*.46,H*.34); ctx.bezierCurveTo(W*.44,H*.28,W*.45,H*.24,W*.47,H*.22); ctx.closePath(); });
+  // Asia
+  fill("#3a6a1e", () => { ctx.moveTo(W*.56,H*.14); ctx.bezierCurveTo(W*.70,H*.10,W*.88,H*.16,W*.90,H*.28); ctx.bezierCurveTo(W*.92,H*.40,W*.82,H*.46,W*.72,H*.46); ctx.bezierCurveTo(W*.62,H*.46,W*.54,H*.40,W*.54,H*.28); ctx.bezierCurveTo(W*.54,H*.20,W*.55,H*.15,W*.56,H*.14); ctx.closePath(); });
+  // Africa
+  fill("#4a7820", () => { ctx.moveTo(W*.50,H*.36); ctx.bezierCurveTo(W*.56,H*.30,W*.62,H*.36,W*.62,H*.50); ctx.bezierCurveTo(W*.62,H*.64,W*.56,H*.76,W*.52,H*.77); ctx.bezierCurveTo(W*.46,H*.74,W*.43,H*.62,W*.44,H*.50); ctx.bezierCurveTo(W*.44,H*.38,W*.46,H*.34,W*.50,H*.36); ctx.closePath(); });
+  // Australia
+  fill("#8b6914", () => { ctx.moveTo(W*.78,H*.60); ctx.bezierCurveTo(W*.84,H*.55,W*.92,H*.60,W*.91,H*.68); ctx.bezierCurveTo(W*.90,H*.74,W*.82,H*.76,W*.77,H*.72); ctx.bezierCurveTo(W*.74,H*.68,W*.74,H*.63,W*.78,H*.60); ctx.closePath(); });
+
+  // Polar ice
+  const ag = ctx.createLinearGradient(0, 0, 0, H * .22);
+  ag.addColorStop(0, "rgba(235,248,255,.95)"); ag.addColorStop(1, "rgba(210,238,255,0)");
+  ctx.fillStyle = ag; ctx.fillRect(0, 0, W, H * .22);
+  const pg = ctx.createLinearGradient(0, H * .80, 0, H);
+  pg.addColorStop(0, "rgba(210,238,255,0)"); pg.addColorStop(1, "rgba(235,248,255,.95)");
+  ctx.fillStyle = pg; ctx.fillRect(0, H * .80, W, H * .20);
+
+  // Faint cloud wisps
+  ctx.globalAlpha = 0.15; ctx.fillStyle = "#ffffff";
+  [[W*.08,H*.35,W*.18,H*.04],[W*.32,H*.44,W*.14,H*.03],[W*.65,H*.42,W*.20,H*.04],[W*.82,H*.38,W*.13,H*.03]].forEach(
+    ([x,y,rx,ry]) => { ctx.beginPath(); ctx.ellipse(x,y,rx,ry,0,0,Math.PI*2); ctx.fill(); },
+  );
+  ctx.globalAlpha = 1;
+  return new THREE.CanvasTexture(cv);
+}
+
 // ─── Satellite / debris definitions ──────────────────────────────
 // r: scene units (1 = 1 R_Earth), omega: rad/s before multiplier,
 // phi0: deterministic start angle (rad), inc: inclination (rad)
+// Orbit design notes:
+//  Pair 1 — SAT-01 (ω=0.30) vs COSMOS 2251 DEB (ω=0.55)
+//    delta_ω = (0.30-0.55)*SIM_SPEED = -0.030 rad/s → converge at T=100s
+//    phi0_COSMOS = phi_sat01 + (-0.030)*100 = phi_sat01 - 3.0 rad  (~opposite side of Earth at t=0)
+//    Detected at sim-t≈0 via 130s lookahead.
+//
+//  Pair 2 — SAT-03 (ω=0.27) vs IRIDIUM 33 DEB (ω=0.50)
+//    delta_ω = (0.27-0.50)*SIM_SPEED = -0.0276 rad/s → converge at T=150s
+//    phi0_IRIDIUM = phi_sat03 + (-0.0276)*150 = phi_sat03 - 4.14 rad (~120° apart at t=0)
+//    Detected at sim-t≈20s via 130s lookahead.
 const SATELLITE_DEFS = [
-  { id: "SAT-01",          type: "satellite", r: 1.075, omega: 0.30 * SIM_SPEED, phi0: 0.0,  inc: 0.90 },
-  { id: "SAT-03",          type: "satellite", r: 1.063, omega: 0.27 * SIM_SPEED, phi0: 1.05, inc: 0.52 },
-  { id: "COSMOS 2251 DEB", type: "debris",    r: 1.082, omega: 0.31 * SIM_SPEED, phi0: 3.30, inc: 0.93 },
-  { id: "IRIDIUM 33 DEB",  type: "debris",    r: 1.068, omega: 0.26 * SIM_SPEED, phi0: 5.00, inc: 1.50 },
+  // ── Collision pair 1: SAT-01 vs COSMOS 2251 DEB (converge ~sim t=100s) ──────
+  { id: "SAT-01",          type: "satellite", r: 1.075, omega: 0.30 * SIM_SPEED, phi0:  0.000, inc: 0.90 },
+  // ── Collision pair 2: SAT-03 vs IRIDIUM 33 DEB (converge ~sim t=150s) ───────
+  { id: "SAT-03",          type: "satellite", r: 1.063, omega: 0.27 * SIM_SPEED, phi0:  1.050, inc: 0.52 },
+  // ── Extra satellites — visibly different speeds, well-separated from debris ──
+  { id: "SAT-02",          type: "satellite", r: 1.160, omega: 0.14 * SIM_SPEED, phi0:  2.100, inc: 0.30 },
+  { id: "SAT-04",          type: "satellite", r: 1.180, omega: 0.09 * SIM_SPEED, phi0:  4.200, inc: 0.65 },
+  { id: "SAT-05",          type: "satellite", r: 1.145, omega: 0.42 * SIM_SPEED, phi0:  0.700, inc: 1.10 },
+  // ── Debris: faster omega creates large initial separation, clean visual approach
+  { id: "COSMOS 2251 DEB", type: "debris",    r: 1.078, omega: 0.55 * SIM_SPEED, phi0: -3.000, inc: 0.90 },
+  { id: "IRIDIUM 33 DEB",  type: "debris",    r: 1.066, omega: 0.50 * SIM_SPEED, phi0: -3.090, inc: 0.52 },
 ];
 
 const COLOR = {
@@ -36,23 +151,34 @@ function orbitalPos(t, r, omega, phi0, inc) {
 
 // ─────────────────────────────────────────────────────────────────
 // Props:
-//   running            boolean  – advances sim time when true
-//   resetKey           number   – increment to restart from t=0
-//   activeConjunctions [{primaryAsset, secondaryObject}]
-//   executedAssets     Set<string>  – assets that had maneuver executed
+//   running              boolean   – advances sim time when true
+//   resetKey             number    – increment to restart from t=0
+//   speedMultiplier      number    – 1 | 2 | 4 | 8 (default 1)
+//   onCollisionDetected  function  – called once per pair when lookahead finds close approach
+//   activeConjunctions   [{primaryAsset, secondaryObject}]
+//   executedAssets       Set<string>  – assets that had maneuver executed
+//   highlightedObjects   Set<string>  – object IDs to highlight in the scene
 // ─────────────────────────────────────────────────────────────────
 export default function OrbitalSimulation({
   running,
   resetKey,
+  speedMultiplier = 1,
+  onCollisionDetected,
   activeConjunctions,
   executedAssets,
+  highlightedObjects,
 }) {
   const mountRef = useRef(null);
 
   // Mutable refs updated from props without re-running the main effect
-  const runningRef        = useRef(running);
-  const activeConjRef     = useRef(activeConjunctions ?? []);
-  const executedRef       = useRef(executedAssets ?? new Set());
+  const runningRef              = useRef(running);
+  const speedRef                = useRef(speedMultiplier);
+  const onCollisionDetectedRef  = useRef(onCollisionDetected);
+  const detectedPairsRef        = useRef(new Map()); // pairKey → sim-time after which re-detection is allowed
+  const phi0sRef                = useRef(generatePhi0s(Date.now())); // randomized each run
+  const activeConjRef           = useRef(activeConjunctions ?? []);
+  const executedRef             = useRef(executedAssets ?? new Set());
+  const highlightedRef          = useRef(highlightedObjects ?? new Set());
 
   // Scene refs
   const sceneRef          = useRef(null);
@@ -64,14 +190,19 @@ export default function OrbitalSimulation({
   const toDisposeRef      = useRef([]);
 
   // Keep mutable refs in sync with props
-  useEffect(() => { runningRef.current = running; }, [running]);
-  useEffect(() => { activeConjRef.current = activeConjunctions ?? []; }, [activeConjunctions]);
-  useEffect(() => { executedRef.current  = executedAssets ?? new Set(); }, [executedAssets]);
+  useEffect(() => { runningRef.current             = running; }, [running]);
+  useEffect(() => { speedRef.current               = speedMultiplier; }, [speedMultiplier]);
+  useEffect(() => { onCollisionDetectedRef.current = onCollisionDetected; }, [onCollisionDetected]);
+  useEffect(() => { activeConjRef.current          = activeConjunctions ?? []; }, [activeConjunctions]);
+  useEffect(() => { executedRef.current            = executedAssets ?? new Set(); }, [executedAssets]);
+  useEffect(() => { highlightedRef.current         = highlightedObjects ?? new Set(); }, [highlightedObjects]);
 
   // ── Reset on resetKey change ──────────────────────────────────
   useEffect(() => {
-    simTimeRef.current  = 0;
-    lastNowRef.current  = null;
+    simTimeRef.current       = 0;
+    lastNowRef.current       = null;
+    detectedPairsRef.current = new Map();           // allow re-detection after restart
+    phi0sRef.current         = generatePhi0s(Date.now()); // new random starting positions
 
     const scene = sceneRef.current;
     if (!scene) return;
@@ -104,7 +235,7 @@ export default function OrbitalSimulation({
 
       const r_new = def.r + 0.018;
       const t     = simTimeRef.current;
-      const currentTheta = def.omega * t + def.phi0;
+      const currentTheta = def.omega * t + (phi0sRef.current[def.id] ?? def.phi0);
 
       // Short green arc showing the burn trajectory
       const arcPts = [];
@@ -192,18 +323,30 @@ export default function OrbitalSimulation({
     scene.add(new THREE.Points(starGeo, starMat));
     toDisposeRef.current.push({ geo: starGeo, mat: starMat });
 
-    // Earth
+    // Earth — textured with atmosphere glow
+    const earthTex = createEarthTexture();
     const earthGeo = new THREE.SphereGeometry(1.0, 64, 32);
     const earthMat = new THREE.MeshPhongMaterial({
-      color: COLOR.earth, emissive: 0x07101a, specular: 0x1a3a5c, shininess: 18,
+      map: earthTex, specular: 0x224488, shininess: 24,
+      emissive: 0x020810, emissiveIntensity: 0.35,
     });
     const earthMesh = new THREE.Mesh(earthGeo, earthMat);
     scene.add(earthMesh);
     toDisposeRef.current.push({ geo: earthGeo, mat: earthMat });
 
+    // Atmosphere haze — rendered from inside so it glows around the limb
+    const atmGeo = new THREE.SphereGeometry(1.030, 64, 32);
+    const atmMat = new THREE.MeshPhongMaterial({
+      color: 0x2255cc, side: THREE.BackSide,
+      transparent: true, opacity: 0.20,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    scene.add(new THREE.Mesh(atmGeo, atmMat));
+    toDisposeRef.current.push({ geo: atmGeo, mat: atmMat });
+
     const gridGeo = new THREE.SphereGeometry(1.004, 24, 12);
     const gridMat = new THREE.MeshBasicMaterial({
-      color: COLOR.earthGrid, wireframe: true, transparent: true, opacity: 0.10,
+      color: COLOR.earthGrid, wireframe: true, transparent: true, opacity: 0.06,
     });
     scene.add(new THREE.Mesh(gridGeo, gridMat));
     toDisposeRef.current.push({ geo: gridGeo, mat: gridMat });
@@ -240,7 +383,7 @@ export default function OrbitalSimulation({
         emissiveIntensity: 0.6,
       });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(orbitalPos(0, def.r, def.omega, def.phi0, def.inc));
+      mesh.position.copy(orbitalPos(0, def.r, def.omega, phi0sRef.current[def.id] ?? def.phi0, def.inc));
       scene.add(mesh);
       objMeshes[def.id] = mesh;
       toDisposeRef.current.push({ geo, mat });
@@ -258,18 +401,20 @@ export default function OrbitalSimulation({
     ro.observe(container);
 
     // Animation loop
+    let frameCount = 0;
     function animate(now) {
       rafId = requestAnimationFrame(animate);
+      frameCount++;
 
-      // Advance sim time only when running
+      // Advance sim time only when running, scaled by speed multiplier
       if (runningRef.current && lastNowRef.current !== null) {
-        simTimeRef.current += (now - lastNowRef.current) / 1000;
+        simTimeRef.current += (now - lastNowRef.current) / 1000 * speedRef.current;
       }
       lastNowRef.current = now;
 
       const t = simTimeRef.current;
 
-      // Update satellite positions
+      // Update satellite positions and highlight state
       for (const def of SATELLITE_DEFS) {
         const mesh = objMeshes[def.id];
         if (!mesh) continue;
@@ -277,7 +422,72 @@ export default function OrbitalSimulation({
         const r = (def.id === "SAT-01" && executedRef.current.has("SAT-01"))
           ? def.r + 0.018
           : def.r;
-        mesh.position.copy(orbitalPos(t, r, def.omega, def.phi0, def.inc));
+        mesh.position.copy(orbitalPos(t, r, def.omega, phi0sRef.current[def.id] ?? def.phi0, def.inc));
+
+        // Pulse emissive intensity when highlighted
+        const highlighted = highlightedRef.current.has(def.id);
+        mesh.material.emissiveIntensity = highlighted
+          ? 1.0 + 0.5 * Math.sin(now * 0.004)
+          : 0.6;
+        mesh.scale.setScalar(highlighted ? 1.45 : 1.0);
+      }
+
+      // ── Collision lookahead scan (every 90 frames ≈ once per wall-second) ──
+      if (runningRef.current && frameCount % 90 === 0 && onCollisionDetectedRef.current) {
+        const defsById = Object.fromEntries(SATELLITE_DEFS.map(d => [d.id, d]));
+
+        for (const { satId, debrisId } of COLLISION_PAIRS) {
+          const sat = defsById[satId];
+          const deb = defsById[debrisId];
+          if (!sat || !deb) continue;
+          const pairKey = `${sat.id}||${deb.id}`;
+          const cooldownUntil = detectedPairsRef.current.get(pairKey) ?? 0;
+          if (t < cooldownUntil) continue;
+
+            // Sample future positions to find minimum approach distance
+            let minDist = Infinity;
+            let minAhead = 0;
+            const satR = (sat.id === "SAT-01" && executedRef.current.has("SAT-01"))
+              ? sat.r + 0.018 : sat.r;
+
+            for (let ahead = 0; ahead <= COLLISION_LOOKAHEAD_SECS; ahead += COLLISION_SAMPLE_STEP) {
+              const ft   = t + ahead;
+              const pSat = orbitalPos(ft, satR, sat.omega, phi0sRef.current[sat.id] ?? sat.phi0, sat.inc);
+              const pDeb = orbitalPos(ft, deb.r, deb.omega, phi0sRef.current[deb.id] ?? deb.phi0, deb.inc);
+              const d    = pSat.distanceTo(pDeb);
+              if (d < minDist) { minDist = d; minAhead = ahead; }
+            }
+
+            if (minDist < DEMO_COLLISION_THRESHOLD) {
+              // Suppress re-detection until 40 sim-sec after the close approach passes
+              detectedPairsRef.current.set(pairKey, t + minAhead + 40);
+
+              // Estimate relative velocity at closest approach point
+              const tca   = t + minAhead;
+              const dt    = 0.5;
+              const satPhi0 = phi0sRef.current[sat.id] ?? sat.phi0;
+              const debPhi0 = phi0sRef.current[deb.id] ?? deb.phi0;
+              const ps1   = orbitalPos(tca,      satR,  sat.omega, satPhi0, sat.inc);
+              const ps2   = orbitalPos(tca + dt, satR,  sat.omega, satPhi0, sat.inc);
+              const pd1   = orbitalPos(tca,      deb.r, deb.omega, debPhi0, deb.inc);
+              const pd2   = orbitalPos(tca + dt, deb.r, deb.omega, debPhi0, deb.inc);
+              const relVelScenePerSec = ps1.clone().sub(pd1)
+                .distanceTo(ps2.clone().sub(pd2)) / dt;
+              const relVelKms = Math.round(relVelScenePerSec * 6371 * 10) / 10;
+
+              console.log(
+                `[Conjunction] ${sat.id} vs ${deb.id} | minDist=${minDist.toFixed(4)} | in ${minAhead.toFixed(1)} sim-s | relVel=${relVelKms} km/s`,
+              );
+
+              onCollisionDetectedRef.current({
+                satId:                    sat.id,
+                debrisId:                 deb.id,
+                closestDistSceneUnits:    minDist,
+                timeToClosestApproachSecs: minAhead,
+                relativeSpeedKms:         relVelKms,
+              });
+          }
+        }
       }
 
       // Manage conjunction lines
@@ -364,10 +574,8 @@ export default function OrbitalSimulation({
           SIM DASHBOARD
         </p>
         <div className="space-y-0.5 text-[10px] font-mono text-neutral-400">
-          <p>Objects: <span className="text-neutral-200">{SATELLITE_DEFS.length}</span></p>
-          <p>SAT-01: <span className="text-cyan-400">LEO 475 km</span></p>
-          <p>SAT-03: <span className="text-cyan-400">LEO 415 km</span></p>
-          <p>Hazards: <span className="text-orange-400">2 debris tracked</span></p>
+          <p>Satellites: <span className="text-cyan-400">{SATELLITE_DEFS.filter(d => d.type === "satellite").length}</span></p>
+          <p>Debris: <span className="text-orange-400">{SATELLITE_DEFS.filter(d => d.type === "debris").length} tracked</span></p>
           <p>Status: <span className={running ? "text-green-400" : "text-amber-400"}>
             {running ? "live" : "paused"}
           </span></p>
