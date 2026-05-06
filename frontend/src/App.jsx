@@ -1265,7 +1265,9 @@ export default function App() {
   // Past agendas saved after execution, available for download
   const [executedAgendas, setExecutedAgendas]     = useState([]); // [{collision, agendas}]
 
-  const [simSpeed, setSimSpeed] = useState(1); // 1 | 2 | 4
+  const [simSpeed, setSimSpeed]           = useState(1); // 1 | 2 | 4
+  const [satelliteCount, setSatelliteCount] = useState(5);
+  const [debrisCount, setDebrisCount]       = useState(2);
 
   // CSV upload state
   const [csvState, setCsvState] = useState({ filename: "", error: "" });
@@ -1400,6 +1402,20 @@ export default function App() {
     setSimSpeed(1);
     triggerCollisionEvent(evDef);
   }, [triggerCollisionEvent]);
+
+  // ── Adjust population counts ──────────────────────────────────
+  const adjustPopulation = useCallback((type, delta) => {
+    const setter = type === "satellite" ? setSatelliteCount : setDebrisCount;
+    setter(prev => {
+      const next = Math.max(1, prev + delta);
+      fetch("http://127.0.0.1:8000/simulation/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ satelliteCount: type === "satellite" ? next : satelliteCount, debrisCount: type === "debris" ? next : debrisCount }),
+      }).catch(() => {});
+      return next;
+    });
+  }, [satelliteCount, debrisCount]);
 
   // ── Start / Stop / Reset simulation ───────────────────────────
   const handleStartStop = useCallback(() => {
@@ -1621,6 +1637,16 @@ ${(ag.tasks ?? []).map(t => `          <Task id="${escapeHtml(t.task_id ?? "")}"
           </span>
         </div>
         <div className="flex items-center gap-4">
+          {/* Population controls */}
+          {[{ label: "Sats", count: satelliteCount, type: "satellite" }, { label: "Debris", count: debrisCount, type: "debris" }].map(({ label, count, type }) => (
+            <div key={type} className="flex items-center gap-1">
+              <span className="text-xs text-neutral-500">{label}</span>
+              <button onClick={() => adjustPopulation(type, -1)} className="w-5 h-5 flex items-center justify-center rounded border border-white/10 text-neutral-400 hover:border-white/25 hover:text-neutral-200 transition-colors cursor-pointer text-xs leading-none">−</button>
+              <span className="text-xs font-mono text-neutral-300 w-4 text-center">{count}</span>
+              <button onClick={() => adjustPopulation(type, +1)} className="w-5 h-5 flex items-center justify-center rounded border border-white/10 text-neutral-400 hover:border-white/25 hover:text-neutral-200 transition-colors cursor-pointer text-xs leading-none">+</button>
+            </div>
+          ))}
+
           {/* Speed controls */}
           <div className="flex items-center gap-1">
             <span className="text-base text-neutral-600 mr-1">Speed</span>
@@ -1682,6 +1708,8 @@ ${(ag.tasks ?? []).map(t => `          <Task id="${escapeHtml(t.task_id ?? "")}"
           running={simRunning}
           resetKey={simResetKey}
           speedMultiplier={simSpeed}
+          satelliteCount={satelliteCount}
+          debrisCount={debrisCount}
           onCollisionDetected={handleCollisionDetected}
           activeConjunctions={activeConjunctions}
           executedAssets={executedAssets}

@@ -16,11 +16,7 @@ const DEMO_COLLISION_THRESHOLD = 0.055;
 const COLLISION_LOOKAHEAD_SECS = 260; // sim-seconds to scan ahead each check (must exceed relative orbital period ~209s)
 const COLLISION_SAMPLE_STEP    = 0.5; // sim-seconds between lookahead samples
 
-// Only these pairs are checked — avoids any cross-pair false positives
-const COLLISION_PAIRS = [
-  { satId: "SAT-01", debrisId: "COSMOS 2251 DEB" },
-  { satId: "SAT-03", debrisId: "IRIDIUM 33 DEB"  },
-];
+// All sat×debris pairs are checked dynamically — no hardcoded list needed.
 
 // ─── Seeded PRNG (mulberry32) ─────────────────────────────────────
 function mulberry32(seed) {
@@ -104,32 +100,40 @@ function createEarthTexture() {
   return new THREE.CanvasTexture(cv);
 }
 
-// ─── Satellite / debris definitions ──────────────────────────────
-// r: scene units (1 = 1 R_Earth), omega: rad/s before multiplier,
-// phi0: deterministic start angle (rad), inc: inclination (rad)
-// Orbit design notes:
-//  Pair 1 — SAT-01 (ω=0.30) vs COSMOS 2251 DEB (ω=0.55)
-//    delta_ω = (0.30-0.55)*SIM_SPEED = -0.030 rad/s → converge at T=100s
-//    phi0_COSMOS = phi_sat01 + (-0.030)*100 = phi_sat01 - 3.0 rad  (~opposite side of Earth at t=0)
-//    Detected at sim-t≈0 via 130s lookahead.
-//
-//  Pair 2 — SAT-03 (ω=0.27) vs IRIDIUM 33 DEB (ω=0.50)
-//    delta_ω = (0.27-0.50)*SIM_SPEED = -0.0276 rad/s → converge at T=150s
-//    phi0_IRIDIUM = phi_sat03 + (-0.0276)*150 = phi_sat03 - 4.14 rad (~120° apart at t=0)
-//    Detected at sim-t≈20s via 130s lookahead.
-const SATELLITE_DEFS = [
-  // ── Collision pair 1: SAT-01 vs COSMOS 2251 DEB (converge ~sim t=100s) ──────
+// ─── Base satellite / debris definitions (always present) ────────
+const BASE_SAT_DEFS = [
   { id: "SAT-01",          type: "satellite", r: 1.075, omega: 0.30 * SIM_SPEED, phi0:  0.000, inc: 0.90 },
-  // ── Collision pair 2: SAT-03 vs IRIDIUM 33 DEB (converge ~sim t=150s) ───────
   { id: "SAT-03",          type: "satellite", r: 1.063, omega: 0.27 * SIM_SPEED, phi0:  1.050, inc: 0.52 },
-  // ── Extra satellites — visibly different speeds, well-separated from debris ──
   { id: "SAT-02",          type: "satellite", r: 1.160, omega: 0.14 * SIM_SPEED, phi0:  2.100, inc: 0.30 },
   { id: "SAT-04",          type: "satellite", r: 1.180, omega: 0.09 * SIM_SPEED, phi0:  4.200, inc: 0.65 },
   { id: "SAT-05",          type: "satellite", r: 1.145, omega: 0.42 * SIM_SPEED, phi0:  0.700, inc: 1.10 },
-  // ── Debris: faster omega creates large initial separation, clean visual approach
+];
+const BASE_DEBRIS_DEFS = [
   { id: "COSMOS 2251 DEB", type: "debris",    r: 1.078, omega: 0.55 * SIM_SPEED, phi0: -3.000, inc: 0.90 },
   { id: "IRIDIUM 33 DEB",  type: "debris",    r: 1.066, omega: 0.50 * SIM_SPEED, phi0: -3.090, inc: 0.52 },
 ];
+
+// Generate a seeded-random extra object def beyond the base list
+function generateDynamicDef(type, index) {
+  const rand  = mulberry32((type === "satellite" ? 0x1000 : 0x2000) + index);
+  const r     = type === "satellite" ? 1.05 + rand() * 0.15 : 1.04 + rand() * 0.14;
+  const omega = type === "satellite"
+    ? (0.10 + rand() * 0.38) * SIM_SPEED
+    : (0.35 + rand() * 0.28) * SIM_SPEED;
+  const phi0  = rand() * Math.PI * 2;
+  const inc   = rand() * 1.4;
+  const num   = String(index + 1).padStart(2, "0");
+  return { id: type === "satellite" ? `SAT-EX-${num}` : `DEB-EX-${num}`, type, r, omega, phi0, inc };
+}
+
+// Build the full def list for a given population
+function buildAllDefs(satCount, debCount) {
+  const sats = Array.from({ length: satCount }, (_, i) =>
+    i < BASE_SAT_DEFS.length ? BASE_SAT_DEFS[i] : generateDynamicDef("satellite", i));
+  const debs = Array.from({ length: debCount }, (_, i) =>
+    i < BASE_DEBRIS_DEFS.length ? BASE_DEBRIS_DEFS[i] : generateDynamicDef("debris", i));
+  return [...sats, ...debs];
+}
 
 const COLOR = {
   satellite: 0x00e5ff,
@@ -154,6 +158,8 @@ function orbitalPos(t, r, omega, phi0, inc) {
 //   running              boolean   – advances sim time when true
 //   resetKey             number    – increment to restart from t=0
 //   speedMultiplier      number    – 1 | 2 | 4 | 8 (default 1)
+//   satelliteCount       number    – how many satellites to show (default 5)
+//   debrisCount          number    – how many debris objects to show (default 2)
 //   onCollisionDetected  function  – called once per pair when lookahead finds close approach
 //   activeConjunctions   [{primaryAsset, secondaryObject}]
 //   executedAssets       Set<string>  – assets that had maneuver executed
@@ -163,6 +169,8 @@ export default function OrbitalSimulation({
   running,
   resetKey,
   speedMultiplier = 1,
+  satelliteCount  = 5,
+  debrisCount     = 2,
   onCollisionDetected,
   activeConjunctions,
   executedAssets,
@@ -183,8 +191,10 @@ export default function OrbitalSimulation({
   // Scene refs
   const sceneRef          = useRef(null);
   const objMeshesRef      = useRef({});
+  const orbitRingsRef     = useRef({});   // def.id → THREE.LineLoop (tracked for dynamic add/remove)
   const conjLinesRef      = useRef({});   // key "A-vs-B" → THREE.Line
   const maneuverArcsRef   = useRef({});   // key assetId (and assetId+"-ring") → line
+  const dynamicDefsRef    = useRef(buildAllDefs(satelliteCount, debrisCount)); // live def list
   const simTimeRef        = useRef(0);
   const lastNowRef        = useRef(null);
   const toDisposeRef      = useRef([]);
@@ -229,7 +239,7 @@ export default function OrbitalSimulation({
     const scene = sceneRef.current;
     if (!scene) return;
 
-    for (const def of SATELLITE_DEFS) {
+    for (const def of dynamicDefsRef.current) {
       if (!executedAssets?.has(def.id)) continue;
       if (maneuverArcsRef.current[def.id]) continue; // already drawn
 
@@ -356,8 +366,8 @@ export default function OrbitalSimulation({
     scene.add(new THREE.Mesh(eqGeo, eqMat));
     toDisposeRef.current.push({ geo: eqGeo, mat: eqMat });
 
-    // Static orbit rings
-    for (const def of SATELLITE_DEFS) {
+    // Orbit rings — tracked by ID for dynamic add/remove
+    for (const def of dynamicDefsRef.current) {
       const pts = [];
       for (let i = 0; i <= 128; i++) {
         const th   = (i / 128) * 2 * Math.PI;
@@ -365,16 +375,17 @@ export default function OrbitalSimulation({
         const yOrb = def.r * Math.sin(th);
         pts.push(new THREE.Vector3(xOrb, yOrb * Math.sin(def.inc), yOrb * Math.cos(def.inc)));
       }
-      const geo = new THREE.BufferGeometry().setFromPoints(pts);
-      const col = def.type === "satellite" ? 0x004466 : 0x552200;
-      const mat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.28 });
-      scene.add(new THREE.LineLoop(geo, mat));
-      toDisposeRef.current.push({ geo, mat });
+      const geo  = new THREE.BufferGeometry().setFromPoints(pts);
+      const col  = def.type === "satellite" ? 0x004466 : 0x552200;
+      const mat  = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.28 });
+      const ring = new THREE.LineLoop(geo, mat);
+      scene.add(ring);
+      orbitRingsRef.current[def.id] = ring;
     }
 
-    // Object meshes – start at deterministic initial positions
+    // Object meshes – start at current sim positions
     const objMeshes = {};
-    for (const def of SATELLITE_DEFS) {
+    for (const def of dynamicDefsRef.current) {
       const isSat = def.type === "satellite";
       const geo   = new THREE.SphereGeometry(isSat ? 0.028 : 0.022, 10, 8);
       const mat   = new THREE.MeshPhongMaterial({
@@ -386,7 +397,6 @@ export default function OrbitalSimulation({
       mesh.position.copy(orbitalPos(0, def.r, def.omega, phi0sRef.current[def.id] ?? def.phi0, def.inc));
       scene.add(mesh);
       objMeshes[def.id] = mesh;
-      toDisposeRef.current.push({ geo, mat });
     }
     objMeshesRef.current = objMeshes;
 
@@ -415,8 +425,8 @@ export default function OrbitalSimulation({
       const t = simTimeRef.current;
 
       // Update satellite positions and highlight state
-      for (const def of SATELLITE_DEFS) {
-        const mesh = objMeshes[def.id];
+      for (const def of dynamicDefsRef.current) {
+        const mesh = objMeshesRef.current[def.id];
         if (!mesh) continue;
         // Raise orbit after maneuver
         const r = (def.id === "SAT-01" && executedRef.current.has("SAT-01"))
@@ -434,12 +444,12 @@ export default function OrbitalSimulation({
 
       // ── Collision lookahead scan (every 90 frames ≈ once per wall-second) ──
       if (runningRef.current && frameCount % 90 === 0 && onCollisionDetectedRef.current) {
-        const defsById = Object.fromEntries(SATELLITE_DEFS.map(d => [d.id, d]));
+        const liveDefs = dynamicDefsRef.current;
+        const liveSats = liveDefs.filter(d => d.type === "satellite");
+        const liveDebs = liveDefs.filter(d => d.type === "debris");
 
-        for (const { satId, debrisId } of COLLISION_PAIRS) {
-          const sat = defsById[satId];
-          const deb = defsById[debrisId];
-          if (!sat || !deb) continue;
+        for (const sat of liveSats) {
+          for (const deb of liveDebs) {
           const pairKey = `${sat.id}||${deb.id}`;
           const cooldownUntil = detectedPairsRef.current.get(pairKey) ?? 0;
           if (t < cooldownUntil) continue;
@@ -486,8 +496,9 @@ export default function OrbitalSimulation({
                 timeToClosestApproachSecs: minAhead,
                 relativeSpeedKms:         relVelKms,
               });
-          }
-        }
+            }
+          } // end deb loop
+        } // end sat loop
       }
 
       // Manage conjunction lines
@@ -498,8 +509,8 @@ export default function OrbitalSimulation({
         const key = `${conj.primaryAsset}-vs-${conj.secondaryObject}`;
         activeKeys.add(key);
 
-        const m1 = objMeshes[conj.primaryAsset];
-        const m2 = objMeshes[conj.secondaryObject];
+        const m1 = objMeshesRef.current[conj.primaryAsset];
+        const m2 = objMeshesRef.current[conj.secondaryObject];
         if (!m1 || !m2) continue;
 
         if (!conjLinesRef.current[key]) {
@@ -542,6 +553,12 @@ export default function OrbitalSimulation({
       ro.disconnect();
       controls.dispose();
       for (const { geo, mat } of toDisposeRef.current) { geo?.dispose(); mat?.dispose(); }
+      for (const ring of Object.values(orbitRingsRef.current)) {
+        ring.geometry?.dispose(); ring.material?.dispose();
+      }
+      for (const mesh of Object.values(objMeshesRef.current)) {
+        mesh.geometry?.dispose(); mesh.material?.dispose();
+      }
       for (const line of Object.values(conjLinesRef.current)) {
         line.geometry?.dispose(); line.material?.dispose();
       }
@@ -552,6 +569,54 @@ export default function OrbitalSimulation({
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Sync population when satellite/debris counts change ──────
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return; // scene not built yet — initial setup handles it
+
+    const newDefs  = buildAllDefs(satelliteCount, debrisCount);
+    const oldDefs  = dynamicDefsRef.current;
+    const newIdSet = new Set(newDefs.map(d => d.id));
+    const oldIdSet = new Set(oldDefs.map(d => d.id));
+
+    // Remove objects no longer in the list
+    for (const def of oldDefs) {
+      if (newIdSet.has(def.id)) continue;
+      const mesh = objMeshesRef.current[def.id];
+      if (mesh) { scene.remove(mesh); mesh.geometry?.dispose(); mesh.material?.dispose(); delete objMeshesRef.current[def.id]; }
+      const ring = orbitRingsRef.current[def.id];
+      if (ring) { scene.remove(ring); ring.geometry?.dispose(); ring.material?.dispose(); delete orbitRingsRef.current[def.id]; }
+    }
+
+    // Add newly introduced objects
+    for (const def of newDefs) {
+      if (oldIdSet.has(def.id)) continue;
+
+      // Orbit ring
+      const pts = [];
+      for (let i = 0; i <= 128; i++) {
+        const th = (i / 128) * 2 * Math.PI;
+        pts.push(new THREE.Vector3(def.r * Math.cos(th), def.r * Math.sin(th) * Math.sin(def.inc), def.r * Math.sin(th) * Math.cos(def.inc)));
+      }
+      const rGeo = new THREE.BufferGeometry().setFromPoints(pts);
+      const rMat = new THREE.LineBasicMaterial({ color: def.type === "satellite" ? 0x004466 : 0x552200, transparent: true, opacity: 0.28 });
+      const ring = new THREE.LineLoop(rGeo, rMat);
+      scene.add(ring);
+      orbitRingsRef.current[def.id] = ring;
+
+      // Mesh
+      const isSat = def.type === "satellite";
+      const mGeo  = new THREE.SphereGeometry(isSat ? 0.028 : 0.022, 10, 8);
+      const mMat  = new THREE.MeshPhongMaterial({ color: isSat ? COLOR.satellite : COLOR.debris, emissive: isSat ? COLOR.satellite : COLOR.debris, emissiveIntensity: 0.6 });
+      const mesh  = new THREE.Mesh(mGeo, mMat);
+      mesh.position.copy(orbitalPos(simTimeRef.current, def.r, def.omega, phi0sRef.current[def.id] ?? def.phi0, def.inc));
+      scene.add(mesh);
+      objMeshesRef.current[def.id] = mesh;
+    }
+
+    dynamicDefsRef.current = newDefs;
+  }, [satelliteCount, debrisCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="flex-1 min-w-0 bg-[#00000a] rounded-2xl border border-neutral-800 relative overflow-hidden">
@@ -574,8 +639,8 @@ export default function OrbitalSimulation({
           SIM DASHBOARD
         </p>
         <div className="space-y-0.5 text-[10px] font-mono text-neutral-400">
-          <p>Satellites: <span className="text-cyan-400">{SATELLITE_DEFS.filter(d => d.type === "satellite").length}</span></p>
-          <p>Debris: <span className="text-orange-400">{SATELLITE_DEFS.filter(d => d.type === "debris").length} tracked</span></p>
+          <p>Satellites: <span className="text-cyan-400">{satelliteCount}</span></p>
+          <p>Debris: <span className="text-orange-400">{debrisCount} tracked</span></p>
           <p>Status: <span className={running ? "text-green-400" : "text-amber-400"}>
             {running ? "live" : "paused"}
           </span></p>
